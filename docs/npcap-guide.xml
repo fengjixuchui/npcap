@@ -59,15 +59,16 @@
           <varlistentry>
             <term><option>/loopback_support</option></term>
             <listitem><para>
-                <emphasis>Support loopback traffic ("Npcap Loopback Adapter"
-                  will be created)</emphasis>. This option allows Npcap to
-                capture and inject traffic that the system sends to itself.
-                Windows does not ordinarily involve NDIS filter drivers in
-                loopback traffic, so a WFP callout driver is used in conjuntion
-                with a virtual network adapter that is a clone of the Microsoft
-                KM-TEST loopback adapter.
+		<emphasis>Legacy loopback support for Nmap 7.80 and older. Not needed for Wireshark.</emphasis>
+		Older versions of Npcap required a Microsoft KM-TEST loopback
+		adapter to be installed in order to capture and inject loopback
+		traffic. This is no longer needed, but some software won't be
+		able to do loopback injection unless the adapter is installed.
+		Use this option to install the legacy loopback adapter if
+		needed.
               </para>
-              <para>The default for this option is <option>yes</option>.
+              <para>See <xref linkend="npcap-feature-loopback" /> for more
+                information.
             </para></listitem>
           </varlistentry>
 
@@ -182,19 +183,6 @@
           </varlistentry>
 
           <varlistentry>
-            <term><option>/dlt_null</option> (deprecated)</term>
-            <listitem><para>
-                <emphasis>Use DLT_NULL as the loopback interface's link layer
-                  protocol instead of DLT_EN10MB</emphasis>. This option
-                defaults to <option>yes</option> because it is more efficient
-                to use the NULL data link type than to create a fake Ethernet
-                header for each captured packet. Certain older software using
-                the undocumented Packet API may be unable to handle DLT_NULL,
-                but we have not been made aware of any.
-            </para></listitem>
-          </varlistentry>
-
-          <varlistentry>
             <term><option>/vlan_support</option> (deprecated, ignored)</term>
             <listitem><para>
                 <emphasis>Support 802.1Q VLAN tag when capturing and sending
@@ -288,11 +276,11 @@
         certain options for reasons like compatibility. It can also use the four value
         mechanism by setting the command-line parameters to <option>disabled</option> or <option>enforced</option>.
         For example, the following command will start an installer GUI with the
-        <option>dlt_null</option> disabled and unselected:
+        <option>loopback_support</option> option disabled and unselected:
       </para>
 
       <para>
-        <command>npcap-<replaceable>version</replaceable>.exe /dlt_null=disabled</command>
+        <command>npcap-<replaceable>version</replaceable>.exe /loopback_support=disabled</command>
       </para>
     </sect3>
 
@@ -348,8 +336,8 @@
             drivers</quote>, see solution
           <ulink role="hidepdf" url="https://social.technet.microsoft.com/Forums/windows/en-US/4deb27fc-33ce-4fc0-a26f-3fec5b57733d/is-there-a-maximum-number-of-network-filter-drivers-in-windows-7?forum=w7itpronetworking">here</ulink>.
       </para></listitem>
-      <listitem><para>Npcap Loopback Adapter is missing:
-          Npcap Loopback Adapter is actually a wrapper of Microsoft Loopback Adapter.
+      <listitem><para>Npcap Loopback Adapter is missing (legacy loopback support):
+          The legacy Npcap Loopback Adapter is actually a wrapper of Microsoft Loopback Adapter.
           Such adapters won't show up in Wireshark if the <varname>Basic Filtering Enging (BFE)</varname>
           service was not running. To fix this issue, you should start this service at <varname>services.msc</varname>
           manually and restart the Npcap service by running <command>net stop npcap</command>

@@ -118,6 +118,7 @@ HANDLE g_hNpcapHelperPipe				=	INVALID_HANDLE_VALUE;	// Handle for NpcapHelper n
 HANDLE g_hDllHandle						=	NULL;					// The handle to this DLL.
 
 CHAR g_strLoopbackAdapterName[BUFSIZE]	= "";						// The name of "Npcap Loopback Adapter".
+#define NPCAP_LOOPBACK_ADAPTER_BUILTIN "NPF_Loopback"
 
 map<string, int> g_nbAdapterMonitorModes;							// The states for all the wireless adapters that show whether it is in the monitor mode.
 
@@ -399,7 +400,7 @@ HMODULE LoadLibrarySafe(LPCTSTR lpFileName)
 {
   TRACE_ENTER();
 
-  TCHAR path[MAX_PATH];
+  TCHAR path[MAX_PATH] = { 0 };
   TCHAR fullFileName[MAX_PATH];
   UINT res;
   HMODULE hModule = NULL;
@@ -407,7 +408,7 @@ HMODULE LoadLibrarySafe(LPCTSTR lpFileName)
   {
 	res = GetSystemDirectory(path, MAX_PATH);
 
-	if (res == 0 || !path)
+	if (res == 0)
 	{
 		//
 		// some bad failure occurred;
@@ -500,7 +501,8 @@ BOOL NpcapCreatePipe(char *pipeName, HANDLE moduleName)
 	else
 	{
 		TRACE_EXIT();
-		CloseHandle(shExInfo.hProcess);
+		if (shExInfo.hProcess)
+			CloseHandle(shExInfo.hProcess);
 		return TRUE;
 	}
 }
@@ -954,28 +956,17 @@ PCHAR NpcapTranslateAdapterName_Standard2Wifi(PCHAR AdapterName)
 {
 	TRACE_ENTER();
 	TRACE_EXIT();
-	return NpcapReplaceString(AdapterName, "_{", "_WIFI_{");
+	return NpcapReplaceString(AdapterName, "{", NPF_DEVICE_NAMES_TAG_WIFI "{");
 }
 
 PCHAR NpcapTranslateAdapterName_Npf2Npcap(PCHAR AdapterName)
 {
-#ifdef NPF_NPCAP_RUN_IN_WINPCAP_MODE
-	UNREFERENCED_PARAMETER(AdapterName);
-	return NULL;
-#else
-	return NpcapReplaceString(AdapterName, "NPF", "NPCAP");
-#endif
+	return NpcapReplaceString(AdapterName, "NPF_", NPF_DEVICE_NAMES_PREFIX);
 }
 
 PCHAR NpcapTranslateMemory_Npcap2Npf(PCHAR pStr, int iBufSize)
 {
-#ifdef NPF_NPCAP_RUN_IN_WINPCAP_MODE
-	UNREFERENCED_PARAMETER(pStr);
-	UNREFERENCED_PARAMETER(iBufSize);
-	return NULL;
-#else
-	return NpcapReplaceMemory(pStr, iBufSize, "NPCAP", "NPF");
-#endif
+	return NpcapReplaceMemory(pStr, iBufSize, NPF_DEVICE_NAMES_PREFIX, "NPF_");
 }
 
 /*! 
@@ -1608,6 +1599,7 @@ BOOLEAN PacketSetReadEvt(LPADAPTER AdapterObject)
 	return TRUE;
 }
 
+#ifdef NPCAP_PACKET_START_SERVICE
 /*! 
   \brief Installs the NPF device driver.
   \return If the function succeeds, the return value is nonzero.
@@ -1707,6 +1699,7 @@ BOOLEAN PacketInstallDriver60()
 	TRACE_EXIT();
 	return result;
 }
+#endif /* NPCAP_PACKET_START_SERVICE */
 
 /*! 
   \brief Dumps a registry key to disk in text format. Uses regedit.
@@ -1837,6 +1830,7 @@ BOOL PacketGetFileVersion(LPTSTR FileName, PCHAR VersionBuff, UINT VersionBuffLe
 	return TRUE;
 }
 
+#ifdef NPCAP_PACKET_START_SERVICE
 BOOL PacketStartService()
 {
 	DWORD error;
@@ -2058,6 +2052,7 @@ BOOL PacketStartService()
 	TRACE_EXIT();
 	return Result;
 }
+#endif /* NPCAP_PACKET_START_SERVICE */
 
 /*! 
   \brief Opens an adapter using the NPF device driver.
@@ -2083,7 +2078,9 @@ LPADAPTER PacketOpenAdapterNPF(PCHAR AdapterNameA)
 	// Though don't bother if we already have a valid pipe to NpcapHelper
 	if (g_hNpcapHelperPipe == INVALID_HANDLE_VALUE)
 	{
+#ifdef NPCAP_PACKET_START_SERVICE
 		PacketStartService();
+#endif
 		if (NpcapIsAdminOnlyMode())
 		{
 			// NpcapHelper Initialization, used for accessing the driver with Administrator privilege.
@@ -4865,9 +4862,18 @@ BOOLEAN PacketIsLoopbackAdapter(PCHAR AdapterName)
 
 	TRACE_ENTER();
 
-	// Set the return value to TRUE for "Npcap Loopback Adapter".
-	if (strcmp(g_strLoopbackAdapterName + sizeof(DEVICE_PREFIX) - 1,
-		AdapterName + sizeof(DEVICE_PREFIX) - 1 + sizeof(NPF_DEVICE_NAMES_PREFIX) - 1) == 0)
+	if (strlen(AdapterName) < sizeof(DEVICE_PREFIX)) {
+		// The adapter name is too short.
+		ret = FALSE;
+	}
+	// Compare to NPF_Loopback
+	else if (strcmp(AdapterName + sizeof(DEVICE_PREFIX) - 1, NPCAP_LOOPBACK_ADAPTER_BUILTIN) == 0 ||
+			// or compare to value in Registry, if it's found and long enough.
+			(strlen(g_strLoopbackAdapterName) > sizeof(DEVICE_PREFIX) &&
+			 strlen(AdapterName) > sizeof(DEVICE_PREFIX) - 1 + sizeof(NPF_DEVICE_NAMES_PREFIX) &&
+			 strcmp(g_strLoopbackAdapterName + sizeof(DEVICE_PREFIX) - 1,
+				 AdapterName + sizeof(DEVICE_PREFIX) - 1 + sizeof(NPF_DEVICE_NAMES_PREFIX) - 1) == 0)
+	   )
 	{
 		ret = TRUE;
 	}

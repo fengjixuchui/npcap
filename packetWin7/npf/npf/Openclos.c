@@ -99,7 +99,6 @@ extern ULONG g_Dot11SupportMode;
 
 #ifdef HAVE_WFP_LOOPBACK_SUPPORT
 	extern HANDLE g_WFPEngineHandle;
-	extern PDEVICE_OBJECT g_LoopbackDevObj;
 #endif
 
 static
@@ -242,17 +241,15 @@ NPF_OpenAdapter(
 	DeviceExtension = DeviceObject->DeviceExtension;
 
 	IrpSp = IoGetCurrentIrpStackLocation(Irp);
-
 	// Find the head adapter of the global array.
-	pFiltMod = NPF_GetFilterModuleByAdapterName(&DeviceExtension->AdapterName, DeviceExtension->Dot11);
+	pFiltMod = NPF_GetFilterModuleByAdapterName(&IrpSp->FileObject->FileName);
 
 	if (pFiltMod == NULL)
 	{
 		// Can't find the adapter from the global open array.
-		TRACE_MESSAGE2(PACKET_DEBUG_LOUD,
-			"NPF_GetOpenByAdapterName error, pFiltMod=NULL, AdapterName=%ws, Dot11=%d",
-			DeviceExtension->AdapterName.Buffer,
-			DeviceExtension->Dot11);
+		TRACE_MESSAGE1(PACKET_DEBUG_LOUD,
+			"NPF_GetOpenByAdapterName error, pFiltMod=NULL, AdapterName=%ws",
+			IrpSp->FileObject->FileName.Buffer);
 
 		Irp->IoStatus.Status = STATUS_NDIS_INTERFACE_NOT_FOUND;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -263,8 +260,8 @@ NPF_OpenAdapter(
 	if (NPF_StartUsingBinding(pFiltMod) == FALSE)
 	{
 		TRACE_MESSAGE1(PACKET_DEBUG_LOUD,
-			"NPF_StartUsingBinding error, AdapterName=%ws",
-			DeviceExtension->AdapterName.Buffer);
+			"NPF_GetOpenByAdapterName error, AdapterName=%ws",
+			IrpSp->FileObject->FileName.Buffer);
 
 		Irp->IoStatus.Status = STATUS_NDIS_OPEN_FAILED;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -286,22 +283,22 @@ NPF_OpenAdapter(
 #ifdef HAVE_WFP_LOOPBACK_SUPPORT
 	TRACE_MESSAGE3(PACKET_DEBUG_LOUD,
 		"Opening the device %ws, BindingContext=%p, Loopback=%u",
-		DeviceExtension->AdapterName.Buffer,
+		IrpSp->FileObject->FileName.Buffer,
 		Open,
 		pFiltMod->Loopback);
 #else
 	TRACE_MESSAGE2(PACKET_DEBUG_LOUD,
 		"Opening the device %ws, BindingContext=%p, Loopback=<Not supported>",
-		DeviceExtension->AdapterName.Buffer,
+		IrpSp->FileObject->FileName.Buffer,
 		Open);
 #endif
 
 #ifdef HAVE_WFP_LOOPBACK_SUPPORT
 	if (pFiltMod->Loopback)
 	{
-		if (g_LoopbackDevObj != NULL && g_WFPEngineHandle == INVALID_HANDLE_VALUE)
+		if (g_WFPEngineHandle == INVALID_HANDLE_VALUE)
 		{
-			TRACE_MESSAGE1(PACKET_DEBUG_LOUD, "g_LoopbackDevObj=%p, init WSK injection handles and register callouts", g_LoopbackDevObj);
+			TRACE_MESSAGE(PACKET_DEBUG_LOUD, "init WSK injection handles and register callouts");
 			// Use Windows Filtering Platform (WFP) to capture loopback packets, also help WSK take care of loopback packet sending.
 			Status = NPF_InitInjectionHandles();
 			if (!NT_SUCCESS(Status))
@@ -309,7 +306,7 @@ NPF_OpenAdapter(
 				goto NPF_OpenAdapter_End;
 			}
 
-			Status = NPF_RegisterCallouts(g_LoopbackDevObj);
+			Status = NPF_RegisterCallouts(DeviceObject);
 			if (!NT_SUCCESS(Status))
 			{
 				if (g_WFPEngineHandle != INVALID_HANDLE_VALUE)
@@ -323,7 +320,7 @@ NPF_OpenAdapter(
 		else
 
 		{
-			TRACE_MESSAGE1(PACKET_DEBUG_LOUD, "g_LoopbackDevObj=%p, NO need to init WSK code", g_LoopbackDevObj);
+			TRACE_MESSAGE(PACKET_DEBUG_LOUD, "g_WFPEngineHandle invalid, not initializing WSK handles");
 		}
 
 		TRACE_MESSAGE1(PACKET_DEBUG_LOUD, "This is loopback adapter, set MTU to: %u", NPF_LOOPBACK_INTERFACR_MTU + ETHER_HDR_LEN);
@@ -468,6 +465,7 @@ NPF_CloseOpenInstance(
 	pOpen->OpenStatus = OpenClosed;
 	NdisReleaseSpinLock(&pOpen->OpenInUseLock);
 }
+
 
 //-------------------------------------------------------------------
 
@@ -1000,7 +998,7 @@ NPF_Cleanup(
 
 	ASSERT(Open != NULL);
 
-	NPF_RemoveFromGroupOpenArray(Open); //Remove the adapter from the group adapter list
+	NPF_RemoveFromGroupOpenArray(Open); //Remove the Open from the filter module's list
 
 	NPF_CloseOpenInstance(Open);
 
@@ -1164,8 +1162,13 @@ NPF_RemoveFromGroupOpenArray(
 
 	TRACE_ENTER();
 
-	ASSERT(pOpen->pFiltMod != NULL);
 	pFiltMod = pOpen->pFiltMod;
+	if (!pFiltMod) {
+		/* This adapter was already removed, so no filter module exists.
+		 * Nothing left to do!
+		 */
+		return;
+	}
 
 	NdisAcquireSpinLock(&pFiltMod->OpenInstancesLock);
 
@@ -1293,15 +1296,70 @@ NPF_EqualAdapterName(
 
 //-------------------------------------------------------------------
 
+#define UNICODE_CONTAINS(a, b, byteoffset) (sizeof(b) == RtlCompareMemory(a.Buffer + byteoffset/sizeof(WCHAR), b, sizeof(b)))
 PNPCAP_FILTER_MODULE
 NPF_GetFilterModuleByAdapterName(
-	PNDIS_STRING pAdapterName,
-	BOOLEAN Dot11
+	PNDIS_STRING pAdapterName
 	)
 {
 	PSINGLE_LIST_ENTRY Curr = NULL;
 	PNPCAP_FILTER_MODULE pFiltMod = NULL;
+	size_t i = 0;
+	size_t shrink_by = 0;
+	BOOLEAN Dot11 = FALSE;
+	BOOLEAN Loopback = FALSE;
+	NDIS_STRING BaseName = NDIS_STRING_CONST("Loopback");
+	WCHAR *pName = NULL;
 	TRACE_ENTER();
+
+#ifdef HAVE_WFP_LOOPBACK_SUPPORT
+	// If this is *not* the legacy loopback name, we'll have to set up BaseName to be the real name of the buffer.
+	if (g_LoopbackAdapterName.Buffer != NULL) {
+		// strip off leading backslashes
+		while (shrink_by < pAdapterName->Length && pAdapterName->Buffer[shrink_by] == L'\\') {
+			shrink_by++;
+		}
+		if (RtlCompareMemory(g_LoopbackAdapterName.Buffer + devicePrefix.Length / 2, pAdapterName->Buffer + shrink_by,
+					pAdapterName->Length - shrink_by / 2) == pAdapterName->Length - shrink_by / 2)
+		{
+			Loopback = TRUE;
+		}
+		// Restore shrink_by in case this wasn't a match.
+		shrink_by = 0;
+	}
+
+	if (!Loopback) {
+#endif
+
+	BaseName.MaximumLength = pAdapterName->MaximumLength;
+	BaseName.Buffer = ExAllocatePoolWithTag(NonPagedPool, BaseName.MaximumLength, 'GFBN');
+	if (BaseName.Buffer == NULL) {
+		IF_LOUD(DbgPrint("NPF_GetFilterModuleByAdapterName: failed to allocate BaseName.Buffer\n");)
+		TRACE_EXIT();
+		return NULL;
+	}
+	RtlCopyUnicodeString(&BaseName, pAdapterName);
+
+	// strip off leading backslashes
+	while (shrink_by < BaseName.Length && BaseName.Buffer[shrink_by] == L'\\') {
+		shrink_by++;
+	}
+
+	// Check for WIFI_ prefix and strip it
+	if (UNICODE_CONTAINS(BaseName, NPF_DEVICE_NAMES_PREFIX_WIDECHAR_WIFI, i)) {
+		shrink_by += sizeof(NPF_DEVICE_NAMES_PREFIX_WIDECHAR)/sizeof(WCHAR) - 1;
+		Dot11 = TRUE;
+	}
+
+	// Do the strip
+	for (i=shrink_by; i < pAdapterName->Length/sizeof(WCHAR) && (i - shrink_by)*sizeof(WCHAR) < BaseName.MaximumLength; i++) {
+		BaseName.Buffer[i - shrink_by] = pAdapterName->Buffer[i];
+	}
+	BaseName.Length = BaseName.Length - shrink_by*sizeof(WCHAR);
+
+#ifdef HAVE_WFP_LOOPBACK_SUPPORT
+	} //end if !Loopback
+#endif
 
 	NdisAcquireSpinLock(&g_FilterArrayLock);
 	for (Curr = g_arrFiltMod.Next; Curr != NULL; Curr = Curr->Next)
@@ -1312,10 +1370,13 @@ NPF_GetFilterModuleByAdapterName(
 			continue;
 		}
 
-		if (NPF_EqualAdapterName(&pFiltMod->AdapterName, pAdapterName) && pFiltMod->Dot11 == Dot11)
+		if (pFiltMod->Dot11 == Dot11 && NPF_EqualAdapterName(&pFiltMod->AdapterName, &BaseName))
 		{
 			NPF_StopUsingBinding(pFiltMod);
 			NdisReleaseSpinLock(&g_FilterArrayLock);
+			if (!Loopback) {
+				ExFreePoolWithTag(BaseName.Buffer, 'GFBN');
+			}
 			return pFiltMod;
 		}
 		else
@@ -1324,6 +1385,9 @@ NPF_GetFilterModuleByAdapterName(
 		}
 	}
 	NdisReleaseSpinLock(&g_FilterArrayLock);
+	if (!Loopback) {
+		ExFreePoolWithTag(BaseName.Buffer, 'GFBN');
+	}
 
 	TRACE_EXIT();
 	return NULL;
@@ -1514,10 +1578,10 @@ NPF_CreateFilterModule(
 	
 	pFiltMod->MaxFrameSize = 0;
 
-	pFiltMod->AdapterName.Buffer = ExAllocatePoolWithTag(NonPagedPool, AdapterName->MaximumLength, 'NPCA');
-	pFiltMod->AdapterName.MaximumLength = AdapterName->MaximumLength;
+	pFiltMod->AdapterName.MaximumLength = AdapterName->MaximumLength - devicePrefix.Length;
+	pFiltMod->AdapterName.Buffer = ExAllocatePoolWithTag(NonPagedPool, pFiltMod->AdapterName.MaximumLength, 'NPCA');
 	pFiltMod->AdapterName.Length = 0;
-	RtlCopyUnicodeString(&pFiltMod->AdapterName, AdapterName);
+	RtlAppendUnicodeToString(&pFiltMod->AdapterName, AdapterName->Buffer + devicePrefix.Length / sizeof(WCHAR));
 
 	//
 	//allocate the spinlock for the OID requests
@@ -1702,6 +1766,22 @@ NPF_AttachAdapter(
 // 			break;
 // 		}
 
+#ifdef HAVE_WFP_LOOPBACK_SUPPORT
+		// Determine whether this is the legacy loopback adapter
+		if (g_LoopbackAdapterName.Buffer != NULL)
+		{
+			if (RtlCompareMemory(g_LoopbackAdapterName.Buffer + devicePrefix.Length / 2, AttachParameters->BaseMiniportName->Buffer + devicePrefix.Length / 2,
+				AttachParameters->BaseMiniportName->Length - devicePrefix.Length) == AttachParameters->BaseMiniportName->Length - devicePrefix.Length)
+			{
+				// This request is for the legacy loopback adapter listed in the Registry.
+				// Since we now have a fake filter module for this, deny the binding.
+				// We'll intercept open requests for this name elsewhere and redirect to the fake one.
+				returnStatus = NDIS_STATUS_NOT_SUPPORTED;
+				break;
+			}
+		}
+#endif
+
 		// create the adapter object
 		pFiltMod = NPF_CreateFilterModule(AttachParameters->BaseMiniportName, AttachParameters->MiniportMediaType);
 		if (pFiltMod == NULL)
@@ -1710,18 +1790,6 @@ NPF_AttachAdapter(
 			TRACE_EXIT();
 			return returnStatus;
 		}
-
-#ifdef HAVE_WFP_LOOPBACK_SUPPORT
-		// Determine whether this is our loopback adapter
-		if (g_LoopbackAdapterName.Buffer != NULL)
-		{
-			if (RtlCompareMemory(g_LoopbackAdapterName.Buffer + devicePrefix.Length / 2, AttachParameters->BaseMiniportName->Buffer + devicePrefix.Length / 2,
-				AttachParameters->BaseMiniportName->Length - devicePrefix.Length) == AttachParameters->BaseMiniportName->Length - devicePrefix.Length)
-			{
-				pFiltMod->Loopback = TRUE;
-			}
-		}
-#endif
 
 #ifdef HAVE_RX_SUPPORT
 		// Determine whether this is our send-to-Rx adapter for the open_instance.
@@ -1872,8 +1940,10 @@ NPF_Pause(
 	NdisAcquireSpinLock(&pFiltMod->OpenInstancesLock);
 	for (Curr = pFiltMod->OpenInstances.Next; Curr != NULL; Curr = Curr->Next)
 	{
-		/* TODO: We don't have to close these open instances if we can
-		 * track them some other way. See #1650 */
+		/* Can't just use NPF_CloseOpenInstance because that waits too
+		 * long (for all IRPs to finish, including stats and other
+		 * things that aren't dependent on OpenRunning status). We'll
+		 * wait for all events in parallel instead. */
 		CONTAINING_RECORD(Curr, OPEN_INSTANCE, OpenInstancesEntry)->OpenStatus = OpenClosing;
 	}
 	NdisReleaseSpinLock(&pFiltMod->OpenInstancesLock);
@@ -2012,6 +2082,7 @@ NOTE: Called at PASSIVE_LEVEL and the filter is in paused state
 	{
 		pOpen = CONTAINING_RECORD(Curr, OPEN_INSTANCE, OpenInstancesEntry);
 		NPF_CloseOpenInstance(pOpen);
+		pOpen->pFiltMod = NULL;
 
 		if (pOpen->ReadEvent != NULL)
 			KeSetEvent(pOpen->ReadEvent, 0, FALSE);
