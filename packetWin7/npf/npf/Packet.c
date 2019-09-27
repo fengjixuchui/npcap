@@ -414,7 +414,7 @@ DriverEntry(
 
 	IF_LOUD(DbgPrint("Trying to create SymLink %ws\n", deviceSymLink.Buffer););
 
-	Status = IoCreateSymbolicLink(&deviceSymLink, &AdapterName) != STATUS_SUCCESS;
+	Status = IoCreateSymbolicLink(&deviceSymLink, &AdapterName);
 	if (!NT_SUCCESS(Status))
 	{
 		IF_LOUD(DbgPrint("\n\nError creating SymLink %ws\nn", deviceSymLink.Buffer););
@@ -515,10 +515,6 @@ DriverEntry(
 
 	TRACE_EXIT();
 	return STATUS_SUCCESS;
-
-	Status = STATUS_UNSUCCESSFUL;
-	TRACE_EXIT();
-	return(Status);
 }
 
 //-------------------------------------------------------------------
@@ -1662,20 +1658,7 @@ NPF_IoControl(
 		}
 
 		OidData = Irp->AssociatedIrp.SystemBuffer;
-		if (FunctionCode == BIOCQUERYOID)
-		{
-			TRACE_MESSAGE2(PACKET_DEBUG_LOUD, "BIOCQUERYOID Request: Oid=%08lx, Length=%08lx", OidData->Oid, OidData->Length);
-		}
-		else if (FunctionCode == BIOCSETOID)
-		{
-			TRACE_MESSAGE2(PACKET_DEBUG_LOUD, "BIOCSETOID Request: Oid=%08lx, Length=%08lx", OidData->Oid, OidData->Length);
-		}
-		else
-		{
-			TRACE_MESSAGE2(PACKET_DEBUG_LOUD, "Unknown FunctionCode: %x, Oid=%08lx", FunctionCode, OidData->Oid);
-			SET_FAILURE_INVALID_REQUEST();
-			break;
-		}
+		TRACE_MESSAGE2(PACKET_DEBUG_LOUD, "%s Request: Oid=%08lx, Length=%08lx", FunctionCode == BIOCQUERYOID ? "BIOCQUERYOID" : "BIOCSETOID", OidData->Oid, OidData->Length);
 
 		//
 		// gain ownership of the Ndis Handle
