@@ -577,10 +577,6 @@ static BOOLEAN PacketGetAddressesFromRegistry(LPCSTR AdapterNameA, PNPF_IF_ADDRE
 	
 	RegCloseKey(TcpIpKey);
 	
-	if (status != ERROR_SUCCESS) {
-		goto fail;
-	}
-	
 	TRACE_PRINT("Successfully retrieved the addresses from the registry.");
 	TRACE_EXIT();
 
@@ -2343,10 +2339,10 @@ static BOOLEAN PacketAddFakeLoopbackAdapter()
 
 	strncpy(TmpAdInfo->Name, LoopbackName, sizeof(TmpAdInfo->Name) - 1);
 	strncpy(TmpAdInfo->Description, LoopbackDesc, sizeof(TmpAdInfo->Description) - 1);
-	TmpAdInfo->LinkLayer.LinkType = NdisMediumNull;
+	TmpAdInfo->LinkLayer.LinkType = (UINT) NdisMediumNull;
 	TmpAdInfo->LinkLayer.LinkSpeed = 10 * 1000 * 1000; //we emulate a fake 10MBit Ethernet
 	TmpAdInfo->Flags = 0;
-	memset(TmpAdInfo->MacAddress,'0',6);
+	memset(TmpAdInfo->MacAddress,'\0',6);
 	TmpAdInfo->MacAddressLen = 6;
 	TmpAdInfo->pNetworkAddresses = NULL;
 
@@ -2424,7 +2420,7 @@ static BOOLEAN PacketAddFakeNdisWanAdapter()
 	TmpAdInfo->LinkLayer.LinkType = NdisMedium802_3;
 	TmpAdInfo->LinkLayer.LinkSpeed = 10 * 1000 * 1000; //we emulate a fake 10MBit Ethernet
 	TmpAdInfo->Flags = INFO_FLAG_NDISWAN_ADAPTER;
-	memset(TmpAdInfo->MacAddress,'0',6);
+	memset(TmpAdInfo->MacAddress,'\0',6);
 	TmpAdInfo->MacAddressLen = 6;
 	TmpAdInfo->pNetworkAddresses = NULL;
 

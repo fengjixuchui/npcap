@@ -110,6 +110,7 @@ HANDLE getDeviceHandleInternal(char *SymbolicLinkA, DWORD *pdwError)
 	{
 		*pdwError = dwError = GetLastError();
 		TRACE_PRINT1("OpenProcess failed, GLE=%d.\n", dwError);
+		CloseHandle(hFile);
 		return INVALID_HANDLE_VALUE;
 	}
 
@@ -119,12 +120,14 @@ HANDLE getDeviceHandleInternal(char *SymbolicLinkA, DWORD *pdwError)
 		&hFileDup, 
 		GENERIC_WRITE | GENERIC_READ,
 		FALSE,
+		// hFile will be closed regardless of error:
 		DUPLICATE_CLOSE_SOURCE);
 	TRACE_PRINT1("Duplicated handle: %08p.\n", hFileDup);
 
+
 	if (!bResult)
 	{
-		TRACE_PRINT1("CreateNamedPipe failed, GLE=%d.\n", GetLastError());
+		TRACE_PRINT1("DuplicateHandle failed, GLE=%d.\n", GetLastError());
 		*pdwError = 1234;
 		return INVALID_HANDLE_VALUE;
 	}
@@ -140,6 +143,7 @@ BOOL createPipe(char *pipeName)
 	BOOL   fConnected = FALSE; 
 	DWORD  dwThreadId = 0; 
 	HANDLE hPipe = INVALID_HANDLE_VALUE, hThread = NULL; 
+	HANDLE hHeap = GetProcessHeap();
 	char lpszPipename[BUFSIZE];
 	sprintf_s(lpszPipename, BUFSIZE, "\\\\.\\pipe\\%s", pipeName);
 	
@@ -185,7 +189,7 @@ BOOL createPipe(char *pipeName)
 	}
 	DWORD cbDacl = sizeof(ACL) + sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD);
 	cbDacl += GetLengthSid(tokenInfoBuffer.tokenUser.User.Sid);
-	PACL pDacl = (PACL) new BYTE[cbDacl];
+	PACL pDacl = (PACL) HeapAlloc(hHeap, 0, cbDacl);
 	if (pDacl == NULL)
 	{
 		TRACE_PRINT("Allocate for DACL failed\n");
@@ -194,13 +198,13 @@ BOOL createPipe(char *pipeName)
 	if (!InitializeAcl(pDacl,cbDacl,ACL_REVISION))
 	{
 		TRACE_PRINT1("InitializeACL failed: %#x\n", GetLastError());
-		delete[] pDacl;
+		HeapFree(hHeap, 0, pDacl);
 		return FALSE;
 	}
 	if (!AddAccessAllowedAce(pDacl, ACL_REVISION, GENERIC_ALL, tokenInfoBuffer.tokenUser.User.Sid))
 	{
 		TRACE_PRINT1("AddAccessAllowedAce failed: %#x\n", GetLastError());
-		delete[] pDacl;
+		HeapFree(hHeap, 0, pDacl);
 		return FALSE;
 	}
 	if (!SetSecurityDescriptorDacl(&sd, TRUE, pDacl, FALSE))
@@ -266,8 +270,8 @@ BOOL createPipe(char *pipeName)
 		else 
 			// The client could not connect, so close the pipe. 
 			CloseHandle(hPipe); 
-	} 
-	delete[] pDacl;
+	}
+	HeapFree(hHeap, 0, pDacl);
 	return TRUE; 
 }
 
