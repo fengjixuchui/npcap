@@ -1,15 +1,35 @@
-## Unreleased changes
+﻿## Npcap 0.9986 [2019-12-17]
 
-* Insecure.Org, LLC's code signing certificate has been renewed, and no longer
-  exists as a SHA-1 certificate. Windows Vista and Server 2008 may therefore
-  not recognize the digital signatures on the filter driver. After Microsoft
-  ends extended support for these operating systems in January 2020, Npcap will
-  be updated to no longer support them as well.
+* Fix a driver signing issue that made Npcap 0.9985 uninstallable on default
+  configurations of Windows 8.1 and older, as well as certain older Windows
+  Server releases. Fixes [#1856](http://issues.nmap.org/1856).
+
+## Npcap 0.9985 [2019-12-13]
+
+* The Nmap Project's (Insecure.Com LLC) code signing certificate has been
+  renewed, and no longer exists as a SHA-1 certificate. Windows Vista and
+  Server 2008 may therefore not recognize the digital signatures on the
+  filter driver so a warning may be presented upon install. Please note
+  that Microsoft is ending support for these operating systems in January 2020.
 
 * WinPcap API-compatible mode no longer installs a separate filter driver.
   Packet.DLL will translate NPF device names so that they are all serviced by
   the npcap.sys driver. The npf.sys driver has been removed. See
   [#1812](http://issues.nmap.org/1812).
+
+* Improve the speed of `pcap_findalldevs` by reducing the number of calls to
+  `GetAdaptersAddresses`, removing a redundant function call, and improving
+  buffer reallocation. Patch by Tomasz Moń
+  ([#20](https://github.com/nmap/npcap/pull/20)).
+
+* Temporary DLLs unpacked during installation are now signed with our code
+  signing certificate. Certain strict application whitelisting systems were
+  complaining about unsigned DLL's loaded from a temporary directory.
+
+* Fixed a bug in the uninstaller preventing downgrades to prior versions of
+  Npcap. On 64-bit Windows, the driver file `npcap.sys` was not properly
+  removed, and Windows would not replace it with any older version. Fixes
+  [#1686](http://issues.nmap.org/1686).
 
 ## Npcap 0.9984 [2019-10-30]
 
