@@ -1,7 +1,7 @@
 /***********************IMPORTANT NPCAP LICENSE TERMS***********************
  *                                                                         *
  * Npcap is a Windows packet sniffing driver and library and is copyright  *
- * (c) 2013-2016 by Insecure.Com LLC ("The Nmap Project").  All rights     *
+ * (c) 2013-2020 by Insecure.Com LLC ("The Nmap Project").  All rights     *
  * reserved.                                                               *
  *                                                                         *
  * Even though Npcap source code is publicly available for review, it is   *
@@ -113,7 +113,7 @@
 
 
 static BOOLEAN PacketAddFakeNdisWanAdapter();
-static BOOLEAN PacketAddFakeLoopbackAdapter();
+extern BOOLEAN g_bLoopbackSupport;
 
 #ifdef HAVE_IPHELPER_API
 static BOOLEAN IsIPv4Enabled(LPCSTR AdapterNameA);
@@ -1216,12 +1216,21 @@ static BOOLEAN PacketAddAdapterNPF(PCHAR AdName, UINT flags)
 	}
 	
 	// Copy the device name
-	strncpy(TmpAdInfo->Name, AdName, sizeof(TmpAdInfo->Name)/ sizeof(TmpAdInfo->Name[0]) - 1);
+	strncpy_s(TmpAdInfo->Name, sizeof(TmpAdInfo->Name), AdName, _TRUNCATE);
 
 	//we do not need to terminate the string TmpAdInfo->Name, since we have left a char at the end, and
 	//the memory for TmpAdInfo was zeroed upon allocation
 
-	if(flags != INFO_FLAG_DONT_EXPORT)
+	if(g_bLoopbackSupport && 0 == strcmp(AdName, FAKE_LOOPBACK_ADAPTER_NAME)) {
+		strncpy_s(TmpAdInfo->Description, sizeof(TmpAdInfo->Description), FAKE_LOOPBACK_ADAPTER_DESCRIPTION, _TRUNCATE);
+		TmpAdInfo->LinkLayer.LinkType = (UINT) NdisMediumNull;
+		TmpAdInfo->LinkLayer.LinkSpeed = 10 * 1000 * 1000; //we emulate a fake 10MBit Ethernet
+		TmpAdInfo->Flags = 0;
+		memset(TmpAdInfo->MacAddress,'\0',6);
+		TmpAdInfo->MacAddressLen = 6;
+		TmpAdInfo->pNetworkAddresses = NULL;
+	}
+	else if(flags != INFO_FLAG_DONT_EXPORT)
 	{
 		PNPF_IF_ADDRESS_ITEM pAddressesFromRegistry;
 
@@ -1240,7 +1249,7 @@ static BOOLEAN PacketAddAdapterNPF(PCHAR AdName, UINT flags)
 		TRACE_PRINT1("Adapter Description = %hs",OidData->Data);
 		
 		// Copy the description
-		strncpy(TmpAdInfo->Description, (PCHAR)OidData->Data, sizeof(TmpAdInfo->Description)/ sizeof(TmpAdInfo->Description[0]) - 1);
+		strncpy_s(TmpAdInfo->Description, sizeof(TmpAdInfo->Description), (PCHAR)OidData->Data, _TRUNCATE);
 		//we do not need to terminate the string TmpAdInfo->Description, since we have left a char at the end, and
 		//the memory for TmpAdInfo was zeroed upon allocation
 		
@@ -1249,7 +1258,7 @@ static BOOLEAN PacketAddAdapterNPF(PCHAR AdName, UINT flags)
 		// Record the name of "Npcap Loopback adapter", as we need it to set NdisMediumNull value for IPHelper version add adapter function.
 		if (TmpAdInfo->LinkLayer.LinkType == (UINT) NdisMediumNull)
 		{
-			strncpy(g_LoopbackAdapterNameForDLTNull, TmpAdInfo->Name, sizeof(g_LoopbackAdapterNameForDLTNull)/ sizeof(g_LoopbackAdapterNameForDLTNull[0]) - 1);
+			strncpy_s(g_LoopbackAdapterNameForDLTNull, sizeof(g_LoopbackAdapterNameForDLTNull), TmpAdInfo->Name, _TRUNCATE);
 		}
 
 		if (Status == FALSE)
@@ -2204,7 +2213,9 @@ BOOLEAN PacketUpdateAdInfo(PCHAR AdapterName)
 	PacketAddFakeNdisWanAdapter();
 #endif //HAVE_WANPACKET_API
 
-	PacketAddFakeLoopbackAdapter();
+	if (g_bLoopbackSupport) {
+		PacketAddAdapterNPF(FAKE_LOOPBACK_ADAPTER_NAME, 0);
+	}
 
 #ifdef HAVE_DAG_API
 	if(g_p_dagc_open != NULL)	
@@ -2285,9 +2296,11 @@ void PacketPopulateAdaptersInfoList()
 	}
 #endif // HAVE_WANPACKET_API
 
-	if (!PacketAddFakeLoopbackAdapter())
-	{
-		TRACE_PRINT("PacketPopulateAdaptersInfoList: adding fake Loopback adapter failed.");
+	if (g_bLoopbackSupport) {
+		if (!PacketAddAdapterNPF(FAKE_LOOPBACK_ADAPTER_NAME, 0))
+		{
+			TRACE_PRINT("PacketPopulateAdaptersInfoList: adding fake Loopback adapter failed.");
+		}
 	}
 
 #ifdef HAVE_AIRPCAP_API
@@ -2325,54 +2338,6 @@ void PacketPopulateAdaptersInfoList()
 	TRACE_EXIT();
 }
 
-static BOOLEAN PacketAddFakeLoopbackAdapter()
-{
-	//this function should acquire the g_AdaptersInfoMutex, since it's NOT called with an ADAPTER_INFO as parameter
-	PADAPTER_INFO TmpAdInfo, SAdInfo;
-	CHAR LoopbackName[MAX_WINPCAP_KEY_CHARS] = FAKE_LOOPBACK_ADAPTER_NAME;
-	CHAR LoopbackDesc[MAX_WINPCAP_KEY_CHARS] = FAKE_LOOPBACK_ADAPTER_DESCRIPTION;
-
-	TRACE_ENTER();
-
-
-	WaitForSingleObject(g_AdaptersInfoMutex, INFINITE);
-	
-	for(SAdInfo = g_AdaptersInfoList; SAdInfo != NULL; SAdInfo = SAdInfo->Next)
-	{
-		if(strcmp(LoopbackName, SAdInfo->Name) == 0)
-		{
-			TRACE_PRINT("PacketAddFakeLoopbackAdapter: Adapter already present in the list");
-			ReleaseMutex(g_AdaptersInfoMutex);
-			TRACE_EXIT();
-			return TRUE;
-		}
-	}
-
-	TmpAdInfo = (PADAPTER_INFO) GlobalAllocPtr(GMEM_MOVEABLE | GMEM_ZEROINIT, sizeof(ADAPTER_INFO));
-	if (TmpAdInfo == NULL) 
-	{
-		TRACE_PRINT("PacketAddFakeLoopbackAdapter: GlobalAlloc Failed allocating memory for the AdInfo structure");
-		ReleaseMutex(g_AdaptersInfoMutex);
-		TRACE_EXIT();
-		return FALSE;
-	}
-
-	strncpy(TmpAdInfo->Name, LoopbackName, sizeof(TmpAdInfo->Name) - 1);
-	strncpy(TmpAdInfo->Description, LoopbackDesc, sizeof(TmpAdInfo->Description) - 1);
-	TmpAdInfo->LinkLayer.LinkType = (UINT) NdisMediumNull;
-	TmpAdInfo->LinkLayer.LinkSpeed = 10 * 1000 * 1000; //we emulate a fake 10MBit Ethernet
-	TmpAdInfo->Flags = 0;
-	memset(TmpAdInfo->MacAddress,'\0',6);
-	TmpAdInfo->MacAddressLen = 6;
-	TmpAdInfo->pNetworkAddresses = NULL;
-
-	TmpAdInfo->Next = g_AdaptersInfoList;
-	g_AdaptersInfoList = TmpAdInfo;
-	ReleaseMutex(g_AdaptersInfoMutex);
-
-	TRACE_EXIT();
-	return TRUE;
-}
 #ifdef HAVE_WANPACKET_API
 
 static BOOLEAN PacketAddFakeNdisWanAdapter()
@@ -2435,8 +2400,8 @@ static BOOLEAN PacketAddFakeNdisWanAdapter()
 		return FALSE;
 	}
 
-	strncpy(TmpAdInfo->Name, DialupName, sizeof(TmpAdInfo->Name) - 1);
-	strncpy(TmpAdInfo->Description, DialupDesc, sizeof(TmpAdInfo->Description) - 1);
+	strncpy_s(TmpAdInfo->Name, sizeof(TmpAdInfo->Name), DialupName, _TRUNCATE);
+	strncpy_s(TmpAdInfo->Description, sizeof(TmpAdInfo->Description), DialupDesc, _TRUNCATE);
 	TmpAdInfo->LinkLayer.LinkType = NdisMedium802_3;
 	TmpAdInfo->LinkLayer.LinkSpeed = 10 * 1000 * 1000; //we emulate a fake 10MBit Ethernet
 	TmpAdInfo->Flags = INFO_FLAG_NDISWAN_ADAPTER;

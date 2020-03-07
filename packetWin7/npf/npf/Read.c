@@ -1,7 +1,7 @@
 /***********************IMPORTANT NPCAP LICENSE TERMS***********************
  *                                                                         *
  * Npcap is a Windows packet sniffing driver and library and is copyright  *
- * (c) 2013-2016 by Insecure.Com LLC ("The Nmap Project").  All rights     *
+ * (c) 2013-2020 by Insecure.Com LLC ("The Nmap Project").  All rights     *
  * reserved.                                                               *
  *                                                                         *
  * Even though Npcap source code is publicly available for review, it is   *
@@ -337,7 +337,9 @@ NPF_Read(
 		if (LocalData->Free < Open->Size)
 		{
 			//there are some packets in the selected (aka LocalData) buffer
-			struct PacketHeader* Header = (struct PacketHeader*)(LocalData->Buffer + LocalData->C);
+			struct PacketHeader* Header = NULL;
+			NdisAcquireSpinLock(&LocalData->BufferLock);
+			Header = (struct PacketHeader*)(LocalData->Buffer + LocalData->C);
 
 			if (Header->SN == Open->ReaderSN)
 			{
@@ -346,6 +348,7 @@ NPF_Read(
 				if (plen + sizeof(struct bpf_hdr) > available - copied)
 				{
 					//if the packet does not fit into the user buffer, we've ended copying packets
+					NdisReleaseSpinLock(&LocalData->BufferLock);
 					NPF_StopUsingOpenInstance(Open);
 					TRACE_EXIT();
 					EXIT_SUCCESS(copied);
@@ -383,15 +386,23 @@ NPF_Read(
 				Open->ReaderSN++;
 				copied += Packet_WORDALIGN(plen);
 
-				increment = plen + sizeof(struct PacketHeader);
 				if (Open->Size - LocalData->C < sizeof(struct PacketHeader))
 				{
 					//the next packet would be saved at the end of the buffer, but the NewHeader struct would be fragmented
 					//so the producer (--> the consumer) skips to the beginning of the buffer
-					increment += Open->Size - LocalData->C;
 					LocalData->C = 0;
 				}
-				InterlockedExchangeAdd(&Open->CpuData[current_cpu].Free, increment);
+
+				/* Update free space. */
+				if (LocalData->C == LocalData->P)
+				{
+					/* Nothing left to read, all space is free. */
+					LocalData->Free = Open->Size;
+				}
+				else
+				{
+					LocalData->Free = (Open->Size - LocalData->P + LocalData->C) % Open->Size;
+				}
 				count = 0;
 			}
 			else
@@ -399,6 +410,7 @@ NPF_Read(
 				current_cpu = (current_cpu + 1) % g_NCpu;
 				count++;
 			}
+			NdisReleaseSpinLock(&LocalData->BufferLock);
 		}
 		else
 		{
@@ -565,7 +577,6 @@ NPF_TapExForEachOpen(
 	ULONG					Cpu;
 	struct PacketHeader*	Header;
 	ULONG					ToCopy;
-	ULONG					increment;
 	ULONG					i;
 
 	UINT					TotalPacketSize;
@@ -937,17 +948,10 @@ NPF_TapExForEachOpen(
 					{
 						LocalData->Dropped++;
 						IF_LOUD(DbgPrint("LocalData->Dropped++, fres = %d, LocalData->Free = %d\n", fres, LocalData->Free);)
-						break;
-					}
-
-					if (LocalData->TransferMdl1 != NULL)
-					{
-						//
-						//if TransferMdl is not NULL, there is some TransferData pending (i.e. not having called TransferDataComplete, yet)
-						//in order to avoid buffer corruption, we drop the packet
-						//
-						LocalData->Dropped++;
-						IF_LOUD(DbgPrint("LocalData->Dropped++, LocalData->TransferMdl1 = %p\n", LocalData->TransferMdl1);)
+						// May as well tell the application, even if MinToCopy is not met,
+						// to avoid dropping further packets
+						if (Open->ReadEvent != NULL)
+							KeSetEvent(Open->ReadEvent, 0, FALSE);
 						break;
 					}
 
@@ -981,8 +985,6 @@ NPF_TapExForEachOpen(
 					if (LocalData->P == Open->Size)
 						LocalData->P = 0;
 
-					increment = sizeof(struct PacketHeader);
-
 #ifdef HAVE_DOT11_SUPPORT
 					if (Dot11RadiotapHeaderSize)
 					{
@@ -1004,7 +1006,6 @@ NPF_TapExForEachOpen(
 						}
 						if (LocalData->P == Open->Size)
 							LocalData->P = 0;
-						increment += Dot11RadiotapHeaderSize;
 					}
 #endif
 
@@ -1058,7 +1059,6 @@ NPF_TapExForEachOpen(
 							IF_LOUD(DbgPrint("iFres = %d, MdlSize = %d, CopyLengthForMDL = %d\n", iFres, BufferLength, CopyLengthForMDL);)
 						}
 
-						increment += CopyLengthForMDL;
 						Header->header.bh_caplen += CopyLengthForMDL;
 						iFres -= CopyLengthForMDL;
 
@@ -1072,11 +1072,14 @@ NPF_TapExForEachOpen(
 					if (Open->Size - LocalData->P < sizeof(struct PacketHeader))  //we check that the available, AND contiguous, space in the buffer will fit
 					{
 						//the NewHeader structure, at least, otherwise we skip the producer
-						increment += Open->Size - LocalData->P;				   //at the beginning of the buffer (p = 0), and decrement the free bytes appropriately
 						LocalData->P = 0;
 					}
 
-					InterlockedExchangeAdd(&LocalData->Free, (ULONG)(-(LONG)increment));
+					/* Update free space.
+					 * Buffer is already locked, so nobody else is updating P and C.
+					 * If P == C, there's no space left, and Size % Size is 0 */
+					LocalData->Free = (Open->Size - LocalData->P + LocalData->C) % Open->Size;
+
 					if (Open->Size - LocalData->Free >= Open->MinToCopy)
 					{
 #ifdef NPCAP_KDUMP

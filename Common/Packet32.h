@@ -1,7 +1,7 @@
 /***********************IMPORTANT NPCAP LICENSE TERMS***********************
  *                                                                         *
  * Npcap is a Windows packet sniffing driver and library and is copyright  *
- * (c) 2013-2016 by Insecure.Com LLC ("The Nmap Project").  All rights     *
+ * (c) 2013-2020 by Insecure.Com LLC ("The Nmap Project").  All rights     *
  * reserved.                                                               *
  *                                                                         *
  * Even though Npcap source code is publicly available for review, it is   *
@@ -111,12 +111,18 @@ typedef struct _AirpcapHandle* PAirpcapHandle;
 // Libpcap/wpcap recognizes this macro and knows Npcap Packet API is provided for compilation.
 #define HAVE_NPCAP_PACKET_API
 
-// Working modes
+// Working modes, a bitfield
+// 0b00000000
+//      |  ||_ STAT or CAPT
+//      |  |__ MON (TME extensions, not supported)
+//      |      UNUSED
+//      |      UNUSED
+//      |_____ DUMP (not supported)
 #define PACKET_MODE_CAPT 0x0 ///< Capture mode
 #define PACKET_MODE_STAT 0x1 ///< Statistical mode
 #define PACKET_MODE_MON 0x2 ///< Monitoring mode
 #define PACKET_MODE_DUMP 0x10 ///< Dump mode
-#define PACKET_MODE_STAT_DUMP MODE_DUMP | MODE_STAT ///< Statistical dump Mode
+#define PACKET_MODE_STAT_DUMP PACKET_MODE_DUMP | PACKET_MODE_STAT ///< Statistical dump Mode
 
 
 /// Alignment macro. Defines the alignment size.

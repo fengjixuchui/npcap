@@ -1,7 +1,7 @@
 /***********************IMPORTANT NPCAP LICENSE TERMS***********************
  *                                                                         *
  * Npcap is a Windows packet sniffing driver and library and is copyright  *
- * (c) 2013-2016 by Insecure.Com LLC ("The Nmap Project").  All rights     *
+ * (c) 2013-2020 by Insecure.Com LLC ("The Nmap Project").  All rights     *
  * reserved.                                                               *
  *                                                                         *
  * Even though Npcap source code is publicly available for review, it is   *
@@ -144,8 +144,6 @@ BOOLEAN PacketUpdateAdInfo(PCHAR AdapterName);
 BOOLEAN IsFireWire(TCHAR *AdapterDesc);
 LPADAPTER PacketOpenAdapterNPF(LPCSTR AdapterName);
 
-#ifndef _WINNT4
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -153,8 +151,6 @@ HMODULE LoadLibrarySafe(LPCTSTR lpFileName);
 #ifdef __cplusplus
 }
 #endif
-
-#endif //_WINNT4
 
 // 
 // Definitions and functions specific to the CACETech airpcap API

@@ -1,7 +1,7 @@
 /***********************IMPORTANT NPCAP LICENSE TERMS***********************
  *                                                                         *
  * Npcap is a Windows packet sniffing driver and library and is copyright  *
- * (c) 2013-2016 by Insecure.Com LLC ("The Nmap Project").  All rights     *
+ * (c) 2013-2020 by Insecure.Com LLC ("The Nmap Project").  All rights     *
  * reserved.                                                               *
  *                                                                         *
  * Even though Npcap source code is publicly available for review, it is   *
@@ -119,21 +119,12 @@ HANDLE g_hDllHandle						=	NULL;					// The handle to this DLL.
 
 CHAR g_strLoopbackAdapterName[BUFSIZE]	= "";						// The name of "Npcap Loopback Adapter".
 #define NPCAP_LOOPBACK_ADAPTER_BUILTIN "NPF_Loopback"
+BOOLEAN g_bLoopbackSupport = TRUE;
 
 map<string, int> g_nbAdapterMonitorModes;							// The states for all the wireless adapters that show whether it is in the monitor mode.
 
 #define SERVICES_REG_KEY "SYSTEM\\CurrentControlSet\\Services\\"
 #define NPCAP_SERVICE_REGISTRY_KEY SERVICES_REG_KEY NPF_DRIVER_NAME
-
-#ifdef _WINNT4
-#if (defined(HAVE_NPFIM_API) || defined(HAVE_WANPACKET_API) || defined (HAVE_AIRPCAP_API) || defined(HAVE_IPHELPER_API))
-#error Do not enable _WINNT4 with any other API
-#endif
-#endif //_WINNT4
-
-#ifdef _WINNT4
-#pragma message ("Compiling Packet.dll for WINNT4 only")
-#endif
 
 #ifdef HAVE_AIRPCAP_API
 #pragma message ("Compiling Packet.dll with support for AirPcap")
@@ -388,7 +379,6 @@ __declspec (dllexport) VOID PacketRegWoemLeaveHandler(PVOID Handler)
 
 //---------------------------------------------------------------------------
 
-#ifndef _WINNT4
 //
 // This wrapper around loadlibrary appends the system folder (usually c:\windows\system32)
 // to the relative path of the DLL, so that the DLL is always loaded from an absolute path
@@ -443,7 +433,6 @@ HMODULE LoadLibrarySafe(LPCTSTR lpFileName)
   TRACE_EXIT();
   return hModule;
 }
-#endif
 
 BOOL NpcapCreatePipe(const char *pipeName, HANDLE moduleName)
 {
@@ -648,7 +637,12 @@ void NpcapGetLoopbackInterfaceName()
 	DWORD size = sizeof(buffer);
 	if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, NPCAP_SERVICE_REGISTRY_KEY "\\Parameters", 0, KEY_READ, &hKey) == ERROR_SUCCESS)
 	{
-		if (RegQueryValueExA(hKey, "LoopbackAdapter", 0, &type,  (LPBYTE)buffer, &size) == ERROR_SUCCESS && type == REG_SZ)
+		if (RegQueryValueExA(hKey, "LoopbackSupport", 0, &type,  (LPBYTE)buffer, &size) == ERROR_SUCCESS && type == REG_DWORD)
+		{
+			g_bLoopbackSupport = (0 != *((DWORD *) buffer));
+		}
+
+		if (g_bLoopbackSupport && RegQueryValueExA(hKey, "LoopbackAdapter", 0, &type,  (LPBYTE)buffer, &size) == ERROR_SUCCESS && type == REG_SZ)
 		{
 			strncpy_s(g_strLoopbackAdapterName, 512, buffer, sizeof(g_strLoopbackAdapterName)/ sizeof(g_strLoopbackAdapterName[0]) - 1);
 		}
@@ -1563,7 +1557,7 @@ BOOLEAN PacketSetReadEvt(LPADAPTER AdapterObject)
 	return TRUE;
 }
 
-#ifdef NPCAP_PACKET_START_SERVICE
+#ifdef NPCAP_PACKET_INSTALL_SERVICE
 /*! 
   \brief Installs the NPF device driver.
   \return If the function succeeds, the return value is nonzero.
@@ -1663,7 +1657,7 @@ BOOLEAN PacketInstallDriver60()
 	TRACE_EXIT();
 	return result;
 }
-#endif /* NPCAP_PACKET_START_SERVICE */
+#endif /* NPCAP_PACKET_INSTALL_SERVICE */
 
 /*! 
   \brief Dumps a registry key to disk in text format. Uses regedit.
@@ -1794,10 +1788,9 @@ BOOL PacketGetFileVersion(LPCTSTR FileName, PCHAR VersionBuff, UINT VersionBuffL
 	return TRUE;
 }
 
-#ifdef NPCAP_PACKET_START_SERVICE
 BOOL PacketStartService()
 {
-	DWORD error;
+	DWORD error = ERROR_SUCCESS;
 	BOOL Result;
 	SC_HANDLE svcHandle = NULL;
 	SC_HANDLE scmHandle = NULL;
@@ -1805,8 +1798,14 @@ BOOL PacketStartService()
 	HKEY PathKey;
 	SERVICE_STATUS SStat;
 	BOOL QuerySStat;
+	static BOOL ServiceStartAttempted = FALSE;
 
 	TRACE_ENTER();
+	if (ServiceStartAttempted) {
+		TRACE_PRINT("PacketStartService: Already tried once.");
+		TRACE_EXIT();
+		return TRUE;
+	}
 
 	//  
 	//	Old registry based WinPcap names
@@ -1838,6 +1837,8 @@ BOOL PacketStartService()
 
 		if (KeyRes != ERROR_SUCCESS)
 		{
+			Result = FALSE;
+#ifdef NPCAP_PACKET_INSTALL_SERVICE
 			TRACE_PRINT("NPF registry key not present, trying to install the driver.");
 			if (bUseNPF60)
 			{
@@ -1847,6 +1848,7 @@ BOOL PacketStartService()
 			{
 				Result = PacketInstallDriver();
 			}
+#endif
 		}
 		else
 		{
@@ -1903,14 +1905,8 @@ BOOL PacketStartService()
 						error = GetLastError();
 						if (error != ERROR_SERVICE_ALREADY_RUNNING && error != ERROR_ALREADY_EXISTS)
 						{
-							SetLastError(error);
-							if (scmHandle != NULL)
-								CloseServiceHandle(scmHandle);
-							error = GetLastError();
 							TRACE_PRINT1("PacketOpenAdapterNPF: StartService failed, LastError=%8.8x", error);
-							TRACE_EXIT();
-							SetLastError(error);
-							return FALSE;
+							Result = FALSE;
 						}
 					}
 				}
@@ -1923,100 +1919,24 @@ BOOL PacketStartService()
 			{
 				error = GetLastError();
 				TRACE_PRINT1("OpenService failed! Error=%8.8x", error);
-				SetLastError(error);
+				Result = FALSE;
 			}
 		}
 		else
 		{
-			if (KeyRes != ERROR_SUCCESS)
-				if (bUseNPF60)
-				{
-					Result = PacketInstallDriver60();
-				}
-				else
-				{
-					Result = PacketInstallDriver();
-				}
-			else
-				Result = TRUE;
-
-			if (Result) {
-
-				svcHandle = OpenServiceA(scmHandle,
-					NpfDriverName,
-					SERVICE_START);
-				if (svcHandle != NULL)
-				{
-
-					QuerySStat = QueryServiceStatus(svcHandle, &SStat);
-
-#ifdef _DBG
-					switch (SStat.dwCurrentState)
-					{
-					case SERVICE_CONTINUE_PENDING:
-						TRACE_PRINT("The status of the driver is: SERVICE_CONTINUE_PENDING");
-						break;
-					case SERVICE_PAUSE_PENDING:
-						TRACE_PRINT("The status of the driver is: SERVICE_PAUSE_PENDING");
-						break;
-					case SERVICE_PAUSED:
-						TRACE_PRINT("The status of the driver is: SERVICE_PAUSED");
-						break;
-					case SERVICE_RUNNING:
-						TRACE_PRINT("The status of the driver is: SERVICE_RUNNING");
-						break;
-					case SERVICE_START_PENDING:
-						TRACE_PRINT("The status of the driver is: SERVICE_START_PENDING");
-						break;
-					case SERVICE_STOP_PENDING:
-						TRACE_PRINT("The status of the driver is: SERVICE_STOP_PENDING");
-						break;
-					case SERVICE_STOPPED:
-						TRACE_PRINT("The status of the driver is: SERVICE_STOPPED");
-						break;
-
-					default:
-						TRACE_PRINT("The status of the driver is: unknown");
-						break;
-					}
-#endif
-
-					if (!QuerySStat || SStat.dwCurrentState != SERVICE_RUNNING){
-
-						TRACE_PRINT("Calling startservice");
-
-						if (StartService(svcHandle, 0, NULL) == 0){
-							error = GetLastError();
-							if (error != ERROR_SERVICE_ALREADY_RUNNING && error != ERROR_ALREADY_EXISTS)
-							{
-								if (scmHandle != NULL) CloseServiceHandle(scmHandle);
-								TRACE_PRINT1("PacketOpenAdapterNPF: StartService failed, LastError=%8.8x", error);
-								TRACE_EXIT();
-								SetLastError(error);
-								return FALSE;
-							}
-						}
-					}
-
-					CloseServiceHandle(svcHandle);
-					svcHandle = NULL;
-
-				}
-				else{
-					error = GetLastError();
-					TRACE_PRINT1("OpenService failed! LastError=%8.8x", error);
-					SetLastError(error);
-				}
-			}
+			error = GetLastError();
+			TRACE_PRINT1("PacketInstallDriver failed! Error=%8.8x", error);
+			Result = FALSE;
 		}
 	}
 
 	if (scmHandle != NULL) CloseServiceHandle(scmHandle);
 
+	ServiceStartAttempted = TRUE;
+	SetLastError(error);
 	TRACE_EXIT();
 	return Result;
 }
-#endif /* NPCAP_PACKET_START_SERVICE */
 
 /*! 
   \brief Opens an adapter using the NPF device driver.
@@ -2042,9 +1962,7 @@ LPADAPTER PacketOpenAdapterNPF(LPCSTR AdapterNameA)
 	// Though don't bother if we already have a valid pipe to NpcapHelper
 	if (g_hNpcapHelperPipe == INVALID_HANDLE_VALUE)
 	{
-#ifdef NPCAP_PACKET_START_SERVICE
 		PacketStartService();
-#endif
 		if (NpcapIsAdminOnlyMode())
 		{
 			// NpcapHelper Initialization, used for accessing the driver with Administrator privilege.
@@ -2067,21 +1985,6 @@ LPADAPTER PacketOpenAdapterNPF(LPCSTR AdapterNameA)
 	lpAdapter->NumWrites=1;
 
 #define DEVICE_PREFIX "\\Device\\"
-
-	// This code is only for NT4, and we are targeting Vista now at least, so it's useless and commented.
-// 	if (LOWORD(GetVersion()) == 4)
-// 	{
-// 		if (strlen(AdapterNameA) > strlen(DEVICE_PREFIX))
-// 		{
-// 			StringCchPrintfA(SymbolicLinkA, MAX_PATH, "\\\\.\\%s", AdapterNameA + strlen(DEVICE_PREFIX));
-// 		}
-// 		else
-// 		{
-// 			ZeroMemory(SymbolicLinkA, sizeof(SymbolicLinkA));
-// 		}
-// 	}
-//  	else
-// 	{
 
 	if (strlen(AdapterNameA) > strlen(DEVICE_PREFIX))
 	{
@@ -2606,9 +2509,7 @@ LPADAPTER PacketOpenAdapter(PCHAR AdapterNameWA)
 	PCHAR AdapterNameA = NULL;
 	PCHAR TranslatedAdapterNameA = NULL;
 	BOOL bFreeAdapterNameA;
-#ifndef _WINNT4
 	PADAPTER_INFO TAdInfo;
-#endif //_WINNT4
 	
 	DWORD dwLastError = ERROR_SUCCESS;
  
@@ -2664,21 +2565,10 @@ LPADAPTER PacketOpenAdapter(PCHAR AdapterNameWA)
 		AdapterNameA = TranslatedAdapterNameA;
 	}
 
-#ifndef _WINNT4
 	WaitForSingleObject(g_AdaptersInfoMutex, INFINITE);
-#endif // not WINNT4
 
 	do
 	{
-
-#ifndef _WINNT4
-		//
-		// Windows NT4 does not have support for the various nifty
-		// adapters supported from 2000 on (airpcap, ndiswan, npfim...)
-		// so we just skip all the magic of the global adapter list, 
-		// and try to open the adapter with PacketOpenAdapterNPF at
-		// the end of this big function!
-		//
 
 		//
 		// If we are here it's because we need to update the list
@@ -2841,17 +2731,6 @@ LPADAPTER PacketOpenAdapter(PCHAR AdapterNameWA)
 			break;
 		}
 
-#endif // not _WINNT4
-
-		//
-		// This is the only code executed on NT4
-		//
-		// Windows NT4 does not have support for the various nifty
-		// adapters supported from 2000 on (airpcap, ndiswan, npfim...)
-		// so we just skip all the magic of the global adapter list, 
-		// and try to open the adapter with PacketOpenAdapterNPF at
-		// the end of this big function!
-		//
 		TRACE_PRINT("Normal NPF adapter, trying to open it...");
 		lpAdapter = PacketOpenAdapterNPF(AdapterNameA);
 		if (lpAdapter == NULL)
@@ -2861,9 +2740,7 @@ LPADAPTER PacketOpenAdapter(PCHAR AdapterNameWA)
 
 	}while(FALSE);
 
-#ifndef _WINNT4
 	ReleaseMutex(g_AdaptersInfoMutex);
-#endif
 
 	if (bFreeAdapterNameA) GlobalFree(AdapterNameA);
 

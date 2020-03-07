@@ -1,4 +1,54 @@
-﻿## Npcap 0.9986 [2019-12-17]
+﻿## Npcap 0.9988 [2020-03-05]
+
+* Formally remove support for Windows Vista and Server 2008. These operating
+  systems have been unsupported by Microsoft since January 2020.
+
+* If a capture is in progress when the system is suspended, it will continue
+  without interruption after the system is woken. This also prevents capture
+  interruptions when the OS makes certain network stack changes.
+  Fixes [#1903](http://issues.nmap.org/1903).
+
+* If the npcap driver is stopped, Packet.dll will attempt to start it
+  automatically. This feature requires Administrator privilege and had been
+  removed in Npcap 0.9983. Fixes [#1911](http://issues.nmap.org/1911). 
+
+* Fix the check for fragmented packets in loopback capture.
+  Closes [PR #22](https://github.com/nmap/npcap/pull/22).
+
+* Eliminate clone/block/inject pattern from loopback capture except for packets
+  already injected by Npcap. Should fix [#1529](http://issues.nmap.org/1529)
+  and [#1789](http://issues.nmap.org/1789).
+
+* Fix an issue in the Npcap OEM installer where silent mode would not detect a
+  failure to install the npcap driver. Fixes [#1910](http://issues.nmap.org/1910).
+
+* Improve the installer to avoid broken installations and allow the installer
+  to continue if a broken installation is detected. Fixes [#1935](http://issues.nmap.org/1935).
+
+## Npcap 0.9987 [2020-02-03]
+
+* Fix an issue where Npcap begins dropping large packets, then smaller ones
+  until finally all packets are dropped. Our fix changes the way remaining free
+  space in the kernel buffer is calculated, which ought to prevent the free
+  space accounting from drifting from reality. Fixes
+  [#1891](http://issues.nmap.org/1891).
+
+* Fix a potential race condition when opening the loopback capture adapter. If
+  two threads simultaneously determine that the WFP filters need to be
+  registered, each may open a handle to the WFP engine using the same global
+  pointer, leading to a double-free when the second one tries to close the
+  handle.
+
+* Allow Packet.dll and the npcap driver to skip loopback-related operations,
+  including WFP and WSK setup, if the `LoopbackSupport` Registry key is set
+  to 0. This configuration will not be supported by the installer, but may
+  serve as a workaround for problems that may be related to Npcap's loopback
+  traffic capture and injection capability.
+
+* Ensure open handles to the Service Control Manager are closed on error in
+  PacketGetFileVersion. Fixes [#1882](http://issues.nmap.org/1882).
+
+## Npcap 0.9986 [2019-12-17]
 
 * Fix a driver signing issue that made Npcap 0.9985 uninstallable on default
   configurations of Windows 8.1 and older, as well as certain older Windows

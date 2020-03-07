@@ -1,7 +1,7 @@
 /***********************IMPORTANT NPCAP LICENSE TERMS***********************
  *                                                                         *
  * Npcap is a Windows packet sniffing driver and library and is copyright  *
- * (c) 2013-2016 by Insecure.Com LLC ("The Nmap Project").  All rights     *
+ * (c) 2013-2020 by Insecure.Com LLC ("The Nmap Project").  All rights     *
  * reserved.                                                               *
  *                                                                         *
  * Even though Npcap source code is publicly available for review, it is   *
@@ -105,6 +105,7 @@ tstring getFileProductName(tstring strFilePath)
 {
 	DWORD dwLen, dwUseless;
 	LPTSTR lpVI;
+	HANDLE hHeap = NULL;
 	tstring strProductName = _T("");
 
 	TRACE_ENTER();
@@ -117,7 +118,15 @@ tstring getFileProductName(tstring strFilePath)
 		return _T("");
 	}
 
-	lpVI = (LPTSTR)GlobalAlloc(GPTR, dwLen);
+	hHeap = GetProcessHeap();
+	if (!hHeap)
+	{
+		TRACE_PRINT1("GetProcessHeap: error, errCode = 0x%08x.", GetLastError());
+		TRACE_EXIT();
+		return _T("");
+	}
+
+	lpVI = (LPTSTR)HeapAlloc(hHeap, 0, dwLen);
 	if (lpVI)
 	{
 		BOOL bRet = FALSE;
@@ -144,14 +153,14 @@ tstring getFileProductName(tstring strFilePath)
 			TRACE_PRINT("VerQueryValue: error.");
 		}
 		//Cleanup
-		GlobalFree((HGLOBAL)lpVI);
+		HeapFree(hHeap, 0, lpVI);
 
 		TRACE_EXIT();
 		return strProductName;
 	}
 	else
 	{
-		TRACE_PRINT1("GlobalAlloc: error, errCode = 0x%08x.", GetLastError());
+		TRACE_PRINT1("HeapAlloc: error, errCode = 0x%08x.", GetLastError());
 		TRACE_EXIT();
 		return _T("");
 	}

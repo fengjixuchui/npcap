@@ -1,7 +1,7 @@
 /***********************IMPORTANT NPCAP LICENSE TERMS***********************
  *                                                                         *
  * Npcap is a Windows packet sniffing driver and library and is copyright  *
- * (c) 2013-2016 by Insecure.Com LLC ("The Nmap Project").  All rights     *
+ * (c) 2013-2020 by Insecure.Com LLC ("The Nmap Project").  All rights     *
  * reserved.                                                               *
  *                                                                         *
  * Even though Npcap source code is publicly available for review, it is   *
@@ -202,13 +202,6 @@ struct sf_pkthdr
 	UINT			len;		///< Length of the original packet (off wire).
 };
 
-//
-// NT4 DDK doesn't have C_ASSERT
-//
-#ifndef C_ASSERT
-#define C_ASSERT(a)
-#endif
-
 /*!
   \brief Structure containing an OID request.
 
@@ -284,9 +277,6 @@ typedef struct __CPU_Private_Data
 									///< driver associates to current instance.
 									///< This number is related to the particular CPU this structure is referring to.
 	NDIS_SPIN_LOCK	BufferLock;		///< It protects the buffer associated with this CPU.
-	PMDL			TransferMdl1;	///< MDL used to map the portion of the buffer that will contain an incoming packet.
-	PMDL			TransferMdl2;	///< Second MDL used to map the portion of the buffer that will contain an incoming packet.
-	ULONG			NewP;			///< Used by NdisTransferData() (when we call NdisTransferData, p index must be updated only in the TransferDataComplete.
 } CpuPrivateData;
 
 
@@ -391,7 +381,7 @@ typedef struct _OPEN_INSTANCE
 											///< explanation
 	ULONG					Multiple_Write_Counter;	///< Counts the number of times a single write has already physically repeated.
 	NDIS_EVENT				WriteEvent;		///< Event used to synchronize the multiple write process.
-	BOOLEAN					WriteInProgress;///< True if a write is currently in progress. NPF currently allows a single wite on
+	BOOLEAN					WriteInProgress;///< True if a write is currently in progress. NPF currently allows a single write on
 											///< the same open instance.
 	NDIS_SPIN_LOCK			WriteLock;		///< SpinLock that protects the WriteInProgress variable.
 

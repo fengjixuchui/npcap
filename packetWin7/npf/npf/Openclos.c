@@ -1,7 +1,7 @@
 /***********************IMPORTANT NPCAP LICENSE TERMS***********************
  *                                                                         *
  * Npcap is a Windows packet sniffing driver and library and is copyright  *
- * (c) 2013-2016 by Insecure.Com LLC ("The Nmap Project").  All rights     *
+ * (c) 2013-2020 by Insecure.Com LLC ("The Nmap Project").  All rights     *
  * reserved.                                                               *
  *                                                                         *
  * Even though Npcap source code is publicly available for review, it is   *
@@ -323,23 +323,9 @@ NPF_OpenAdapter(
 			TRACE_MESSAGE(PACKET_DEBUG_LOUD, "g_WFPEngineHandle invalid, not initializing WSK handles");
 		}
 
-		TRACE_MESSAGE1(PACKET_DEBUG_LOUD, "This is loopback adapter, set MTU to: %u", NPF_LOOPBACK_INTERFACR_MTU + ETHER_HDR_LEN);
-		pFiltMod->MaxFrameSize = NPF_LOOPBACK_INTERFACR_MTU + ETHER_HDR_LEN;
 		Status = STATUS_SUCCESS;
 	}
-	else
 #endif
-	{
-		pFiltMod->MaxFrameSize = 1514;
-		Status = STATUS_SUCCESS;
-		// This call will cause SYSTEM_SERVICE_EXCEPTION BSoD sometimes.
-		// I didn't figure out the reason, I threw an ask on Stackoverflow: http://stackoverflow.com/questions/31869373/get-system-service-exception-bluescreen-when-starting-wireshark-on-win10-vmware
-		// But no replies, so I just workaround by hard-coding it as 1514 for now.
-// 		if (NPF_GetDeviceMTU(pFiltMod, &pFiltMod->MaxFrameSize) != STATUS_SUCCESS)
-// 		{
-// 			pFiltMod->MaxFrameSize = 1514;
-// 		}
-	}
 
 #ifdef HAVE_DOT11_SUPPORT
 	// Fetch the device's data rate mapping table with the OID_DOT11_DATA_RATE_MAPPING_TABLE OID.
@@ -1296,7 +1282,7 @@ NPF_EqualAdapterName(
 
 //-------------------------------------------------------------------
 
-#define UNICODE_CONTAINS(a, b, byteoffset) (sizeof(b) == RtlCompareMemory(a.Buffer + byteoffset/sizeof(WCHAR), b, sizeof(b)))
+#define PUNICODE_CONTAINS(a, b, byteoffset) (sizeof(b) == RtlCompareMemory(a->Buffer + byteoffset/sizeof(WCHAR), b, sizeof(b)))
 PNPCAP_FILTER_MODULE
 NPF_GetFilterModuleByAdapterName(
 	PNDIS_STRING pAdapterName
@@ -1338,15 +1324,14 @@ NPF_GetFilterModuleByAdapterName(
 		TRACE_EXIT();
 		return NULL;
 	}
-	RtlCopyUnicodeString(&BaseName, pAdapterName);
 
 	// strip off leading backslashes
-	while (shrink_by < BaseName.Length && BaseName.Buffer[shrink_by] == L'\\') {
+	while (shrink_by < pAdapterName->Length && pAdapterName->Buffer[shrink_by] == L'\\') {
 		shrink_by++;
 	}
 
 	// Check for WIFI_ prefix and strip it
-	if (UNICODE_CONTAINS(BaseName, NPF_DEVICE_NAMES_PREFIX_WIDECHAR_WIFI, i)) {
+	if (PUNICODE_CONTAINS(pAdapterName, NPF_DEVICE_NAMES_PREFIX_WIDECHAR_WIFI, shrink_by * sizeof(WCHAR))) {
 		shrink_by += sizeof(NPF_DEVICE_NAMES_PREFIX_WIDECHAR)/sizeof(WCHAR) - 1;
 		Dot11 = TRUE;
 	}
@@ -1355,7 +1340,7 @@ NPF_GetFilterModuleByAdapterName(
 	for (i=shrink_by; i < pAdapterName->Length/sizeof(WCHAR) && (i - shrink_by)*sizeof(WCHAR) < BaseName.MaximumLength; i++) {
 		BaseName.Buffer[i - shrink_by] = pAdapterName->Buffer[i];
 	}
-	BaseName.Length = BaseName.Length - shrink_by*sizeof(WCHAR);
+	BaseName.Length = pAdapterName->Length - shrink_by*sizeof(WCHAR);
 
 #ifdef HAVE_WFP_LOOPBACK_SUPPORT
 	} //end if !Loopback
@@ -1576,7 +1561,9 @@ NPF_CreateFilterModule(
 	KeInitializeSpinLock(&pFiltMod->RequestSpinLock);
 	InitializeListHead(&pFiltMod->RequestList);
 	
-	pFiltMod->MaxFrameSize = 0;
+	// Default; expect this will be overwritten in NPF_Restart,
+	// or for Loopback when creating the fake module.
+	pFiltMod->MaxFrameSize = 1514;
 
 	pFiltMod->AdapterName.MaximumLength = AdapterName->MaximumLength - devicePrefix.Length;
 	pFiltMod->AdapterName.Buffer = ExAllocatePoolWithTag(NonPagedPool, pFiltMod->AdapterName.MaximumLength, 'NPCA');
@@ -1658,6 +1645,46 @@ Return Value:
 
 //-------------------------------------------------------------------
 
+static NDIS_STATUS NPF_ValidateParameters(
+		BOOLEAN bDot11,
+        NDIS_MEDIUM MiniportMediaType
+        )
+{
+    // Verify the media type is supported.  This is a last resort; the
+    // the filter should never have been bound to an unsupported miniport
+    // to begin with.  If this driver is marked as a Mandatory filter (which
+    // is the default for this sample; see the INF file), failing to attach
+    // here will leave the network adapter in an unusable state.
+    //
+    // Your setup/install code should not bind the filter to unsupported
+    // media types.
+    if ((MiniportMediaType != NdisMedium802_3)
+            && (MiniportMediaType != NdisMediumNative802_11)
+            && (MiniportMediaType != NdisMediumWan) //we don't care this kind of miniports
+            && (MiniportMediaType != NdisMediumWirelessWan) //we don't care this kind of miniports
+            && (MiniportMediaType != NdisMediumFddi)
+            && (MiniportMediaType != NdisMediumArcnet878_2)
+            && (MiniportMediaType != NdisMediumAtm)
+            && (MiniportMediaType != NdisMedium802_5))
+    {
+		IF_LOUD(DbgPrint("Unsupported media type: MiniportMediaType = %d.\n", MiniportMediaType);)
+
+		return NDIS_STATUS_INVALID_PARAMETER;
+    }
+
+	// The WiFi filter will only bind to the 802.11 wireless adapters.
+	if (g_Dot11SupportMode && bDot11)
+	{
+		if (MiniportMediaType != NdisMediumNative802_11)
+		{
+			IF_LOUD(DbgPrint("Unsupported media type for the WiFi filter: MiniportMediaType = %d, expected = 16 (NdisMediumNative802_11).\n", AttachParameters->MiniportMediaType);)
+
+			return NDIS_STATUS_INVALID_PARAMETER;
+		}
+	}
+	return NDIS_STATUS_SUCCESS;
+}
+
 _Use_decl_annotations_
 NDIS_STATUS
 NPF_AttachAdapter(
@@ -1680,29 +1707,6 @@ NPF_AttachAdapter(
 		ASSERT(FilterDriverContext == (NDIS_HANDLE)FilterDriverObject);
 		if (FilterDriverContext != (NDIS_HANDLE)FilterDriverObject)
 		{
-			returnStatus = NDIS_STATUS_INVALID_PARAMETER;
-			break;
-		}
-
-		// Verify the media type is supported.  This is a last resort; the
-		// the filter should never have been bound to an unsupported miniport
-		// to begin with.  If this driver is marked as a Mandatory filter (which
-		// is the default for this sample; see the INF file), failing to attach
-		// here will leave the network adapter in an unusable state.
-		//
-		// Your setup/install code should not bind the filter to unsupported
-		// media types.
-		if ((AttachParameters->MiniportMediaType != NdisMedium802_3)
-				&& (AttachParameters->MiniportMediaType != NdisMediumNative802_11)
-				&& (AttachParameters->MiniportMediaType != NdisMediumWan) //we don't care this kind of miniports
-				&& (AttachParameters->MiniportMediaType != NdisMediumWirelessWan) //we don't care this kind of miniports
-				&& (AttachParameters->MiniportMediaType != NdisMediumFddi)
-				&& (AttachParameters->MiniportMediaType != NdisMediumArcnet878_2)
-				&& (AttachParameters->MiniportMediaType != NdisMediumAtm)
-				&& (AttachParameters->MiniportMediaType != NdisMedium802_5))
-		{
-			IF_LOUD(DbgPrint("Unsupported media type: MiniportMediaType = %d.\n", AttachParameters->MiniportMediaType);)
-
 			returnStatus = NDIS_STATUS_INVALID_PARAMETER;
 			break;
 		}
@@ -1745,17 +1749,9 @@ NPF_AttachAdapter(
 			break;
 		}
 
-		// The WiFi filter will only bind to the 802.11 wirelress adapters.
-		if (g_Dot11SupportMode && bDot11)
-		{
-			if (AttachParameters->MiniportMediaType != NdisMediumNative802_11)
-			{
-				IF_LOUD(DbgPrint("Unsupported media type for the WiFi filter: MiniportMediaType = %d, expected = 16 (NdisMediumNative802_11).\n", AttachParameters->MiniportMediaType);)
-
-				returnStatus = NDIS_STATUS_INVALID_PARAMETER;
-				break;
-			}
-		}
+		returnStatus = NPF_ValidateParameters(bDot11, AttachParameters->MiniportMediaType);
+		if (returnStatus != STATUS_SUCCESS)
+			break;
 
 		// Disable this code for now, because it invalidates most adapters to be bound, reason needs to be clarified.
 // 		if (AttachParameters->LowerIfIndex != AttachParameters->BaseMiniportIfIndex)
@@ -1858,7 +1854,7 @@ NPF_AttachAdapter(
 			"HigherPacketFilter=%x",
 			pFiltMod->HigherPacketFilter);
 
-		pFiltMod->PhysicalMedium = NPF_GetPhysicalMedium(pFiltMod);
+		pFiltMod->PhysicalMedium = AttachParameters->MiniportPhysicalMediaType;
 		TRACE_MESSAGE1(PACKET_DEBUG_LOUD,
 			"PhysicalMedium=%x",
 			pFiltMod->PhysicalMedium);
@@ -1937,64 +1933,12 @@ NPF_Pause(
 	NdisAcquireSpinLock(&pFiltMod->AdapterHandleLock);
 	pFiltMod->AdapterBindingStatus = FilterPausing;
 	
-	NdisAcquireSpinLock(&pFiltMod->OpenInstancesLock);
-	for (Curr = pFiltMod->OpenInstances.Next; Curr != NULL; Curr = Curr->Next)
-	{
-		/* Can't just use NPF_CloseOpenInstance because that waits too
-		 * long (for all IRPs to finish, including stats and other
-		 * things that aren't dependent on OpenRunning status). We'll
-		 * wait for all events in parallel instead. */
-		CONTAINING_RECORD(Curr, OPEN_INSTANCE, OpenInstancesEntry)->OpenStatus = OpenClosing;
-	}
-	NdisReleaseSpinLock(&pFiltMod->OpenInstancesLock);
-
 	while (pFiltMod->AdapterHandleUsageCounter > 0)
 	{
 		NdisReleaseSpinLock(&pFiltMod->AdapterHandleLock);
 		NdisWaitEvent(&Event, 1);
 		NdisAcquireSpinLock(&pFiltMod->AdapterHandleLock);
 	}
-
-	NdisAcquireSpinLock(&pFiltMod->OpenInstancesLock);
-	do
-	{
-		PendingWrites = FALSE;
-		for (Curr = pFiltMod->OpenInstances.Next; Curr != NULL; Curr = Curr->Next)
-		{
-			pOpen = CONTAINING_RECORD(Curr, OPEN_INSTANCE, OpenInstancesEntry);
-			NdisAcquireSpinLock(&pOpen->OpenInUseLock);
-			if (pOpen->TransmitPendingPackets > 0 || pOpen->Multiple_Write_Counter > 0)
-			{
-				PendingWrites = TRUE;
-				NdisReleaseSpinLock(&pOpen->OpenInUseLock);
-				NdisReleaseSpinLock(&pFiltMod->OpenInstancesLock);
-				NdisReleaseSpinLock(&pFiltMod->AdapterHandleLock);
-				NdisWaitEvent(&pOpen->NdisWriteCompleteEvent, 10);
-				NdisAcquireSpinLock(&pFiltMod->AdapterHandleLock);
-				NdisAcquireSpinLock(&pFiltMod->OpenInstancesLock);
-				/* Have to break because we released OpenInstancesLock, and list could have changed. */
-				break;
-			}
-			else if (pOpen->NumPendingIrps > 0)
-			{
-				PendingWrites = TRUE;
-				NdisReleaseSpinLock(&pOpen->OpenInUseLock);
-				NdisReleaseSpinLock(&pFiltMod->OpenInstancesLock);
-				NdisReleaseSpinLock(&pFiltMod->AdapterHandleLock);
-				NdisWaitEvent(&Event, 10);
-				NdisAcquireSpinLock(&pFiltMod->AdapterHandleLock);
-				NdisAcquireSpinLock(&pFiltMod->OpenInstancesLock);
-				/* Have to break because we released OpenInstancesLock, and list could have changed. */
-				break;
-			}
-			else
-			{
-				pOpen->OpenStatus = OpenClosed;
-			}
-			NdisReleaseSpinLock(&pOpen->OpenInUseLock);
-		}
-	} while (PendingWrites);
-	NdisReleaseSpinLock(&pFiltMod->OpenInstancesLock);
 
 	pFiltMod->AdapterBindingStatus = FilterPaused;
 	NdisReleaseSpinLock(&pFiltMod->AdapterHandleLock);
@@ -2016,8 +1960,9 @@ NPF_Restart(
 {
 
 	PNPCAP_FILTER_MODULE pFiltMod = (PNPCAP_FILTER_MODULE)FilterModuleContext;
-	PSINGLE_LIST_ENTRY Curr;
 	NDIS_STATUS		Status;
+	PNDIS_RESTART_ATTRIBUTES Curr = RestartParameters->RestartAttributes;
+	PNDIS_RESTART_GENERAL_ATTRIBUTES GenAttr = NULL;
 
 	TRACE_ENTER();
 
@@ -2029,17 +1974,24 @@ NPF_Restart(
 	ASSERT(pFiltMod->AdapterBindingStatus == FilterPaused);
 	pFiltMod->AdapterBindingStatus = FilterRestarting;
 
-	NdisAcquireSpinLock(&pFiltMod->OpenInstancesLock);
-	for (Curr = pFiltMod->OpenInstances.Next; Curr != NULL; Curr = Curr->Next)
-	{
-		CONTAINING_RECORD(Curr, OPEN_INSTANCE, OpenInstancesEntry)->OpenStatus = OpenRunning;
+	Status = NPF_ValidateParameters(pFiltMod->Dot11, RestartParameters->MiniportMediaType);
+	if (Status != NDIS_STATUS_SUCCESS) {
+		goto NPF_Restart_End;
 	}
-	NdisReleaseSpinLock(&pFiltMod->OpenInstancesLock);
 
-	pFiltMod->AdapterBindingStatus = FilterRunning;
+	do {
+		if (Curr->Oid == OID_GEN_MINIPORT_RESTART_ATTRIBUTES) {
+			GenAttr = (PNDIS_RESTART_GENERAL_ATTRIBUTES) Curr->Data;
+			pFiltMod->MaxFrameSize = GenAttr->MtuSize;
+			break;
+		}
+	} while (Curr = Curr->Next);
+
+
+NPF_Restart_End:
+	pFiltMod->AdapterBindingStatus = NDIS_STATUS_SUCCESS == Status ? FilterRunning : FilterPaused;
 	NdisReleaseSpinLock(&pFiltMod->AdapterHandleLock);
 
-	Status = NDIS_STATUS_SUCCESS;
 	TRACE_EXIT();
 	return Status;
 }

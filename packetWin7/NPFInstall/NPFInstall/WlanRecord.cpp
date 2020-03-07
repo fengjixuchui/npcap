@@ -1,7 +1,7 @@
 /***********************IMPORTANT NPCAP LICENSE TERMS***********************
  *                                                                         *
  * Npcap is a Windows packet sniffing driver and library and is copyright  *
- * (c) 2013-2016 by Insecure.Com LLC ("The Nmap Project").  All rights     *
+ * (c) 2013-2020 by Insecure.Com LLC ("The Nmap Project").  All rights     *
  * reserved.                                                               *
  *                                                                         *
  * Even though Npcap source code is publicly available for review, it is   *
@@ -150,49 +150,65 @@ tstring printArray(vector<tstring> nstr)
 }
 
 // enumerate wireless interfaces
-UINT EnumInterface(HANDLE hClient, WLAN_INTERFACE_INFO sInfo[64])
+PWLAN_INTERFACE_INFO EnumInterface(HANDLE hClient, UINT *numInterfaces)
 {
 	TRACE_ENTER();
 
 	DWORD dwError = ERROR_SUCCESS;
 	PWLAN_INTERFACE_INFO_LIST pIntfList = NULL;
 	UINT i = 0;
+	HANDLE hHeap = NULL;
+	WLAN_INTERFACE_INFO *sInfo = NULL;
 
-	__try
+	// enumerate wireless interfaces
+	if ((dwError = My_WlanEnumInterfaces(
+		hClient,
+		NULL,               // reserved
+		&pIntfList
+	)) != ERROR_SUCCESS || pIntfList == NULL)
 	{
-		// enumerate wireless interfaces
-		if ((dwError = My_WlanEnumInterfaces(
-			hClient,
-			NULL,               // reserved
-			&pIntfList
-			)) != ERROR_SUCCESS)
-		{
-			TRACE_PRINT1("My_WlanEnumInterfaces: error, errCode = 0x%08x.", dwError);
-			__leave;
-		}
-
-		// print out interface information
-		for (i = 0; i < pIntfList->dwNumberOfItems; i++)
-		{
-			memcpy(&sInfo[i], &pIntfList->InterfaceInfo[i], sizeof(WLAN_INTERFACE_INFO));
-		}
-
-		TRACE_PRINT1("My_WlanEnumInterfaces: pIntfList->dwNumberOfItems = %d.", pIntfList->dwNumberOfItems);
+		TRACE_PRINT1("My_WlanEnumInterfaces: error, errCode = 0x%08x.", dwError);
+		return NULL;
+	}
+	if (pIntfList == NULL || pIntfList->dwNumberOfItems == 0)
+	{
+		TRACE_PRINT("My_WlanEnumInterfaces: No Interfaces.");
+		return NULL;
+	}
+	*numInterfaces = pIntfList->dwNumberOfItems;
+	hHeap = GetProcessHeap();
+	if (!hHeap)
+	{
+		TRACE_PRINT1("GetProcessHeap: error, errCode = 0x%08x.", GetLastError());
+		My_WlanFreeMemory(pIntfList);
 		TRACE_EXIT();
-		return pIntfList->dwNumberOfItems;
-	}
-	__finally
-	{
-		// clean up
-		if (pIntfList != NULL)
-		{
-			My_WlanFreeMemory(pIntfList);
-		}
+		return NULL;
 	}
 
-	TRACE_PRINT1("My_WlanEnumInterfaces: pIntfList->dwNumberOfItems = %d.", pIntfList->dwNumberOfItems);
+	sInfo = (PWLAN_INTERFACE_INFO)HeapAlloc(hHeap, 0, *numInterfaces);
+
+	if (sInfo == NULL)
+	{
+		TRACE_PRINT1("HeapAlloc: error, errCode = 0x%08x.", GetLastError());
+		My_WlanFreeMemory(pIntfList);
+		TRACE_EXIT();
+		return NULL;
+	}
+
+	// print out interface information
+	for (i = 0; i < *numInterfaces; i++)
+	{
+		memcpy(&sInfo[i], &pIntfList->InterfaceInfo[i], sizeof(WLAN_INTERFACE_INFO));
+	}
+
+	TRACE_PRINT1("My_WlanEnumInterfaces: pIntfList->dwNumberOfItems = %d.", *numInterfaces);
+
+
+	// clean up
+	My_WlanFreeMemory(pIntfList);
+
 	TRACE_EXIT();
-	return 0;
+	return sInfo;
 }
 
 // open a WLAN client handle and check version
@@ -256,7 +272,7 @@ vector<tstring> getWlanAdapterGuids()
 	TRACE_ENTER();
 
 	HANDLE hClient = NULL;
-	WLAN_INTERFACE_INFO sInfo[64];
+	WLAN_INTERFACE_INFO *sInfo = NULL;
 	RPC_TSTR strGuid = NULL;
 	vector<tstring> nstrWlanAdapterGuids;
 
@@ -274,14 +290,27 @@ vector<tstring> getWlanAdapterGuids()
 		return nstrWlanAdapterGuids;
 	}
 
-	UINT nCount = EnumInterface(hClient, sInfo);
-	for (UINT i = 0; i < nCount; ++i)
+	UINT nCount = 0;
+	sInfo = EnumInterface(hClient, &nCount);
+	if (sInfo != NULL)
 	{
-		if (UuidToString(&sInfo[i].InterfaceGuid, &strGuid) == RPC_S_OK)
+		for (UINT i = 0; i < nCount; ++i)
 		{
-			TRACE_PRINT1("EnumInterface: executing, strGuid = %s.", (TCHAR*) strGuid);
-			nstrWlanAdapterGuids.push_back((TCHAR*) strGuid);
-			RpcStringFree(&strGuid);
+			if (UuidToString(&sInfo[i].InterfaceGuid, &strGuid) == RPC_S_OK)
+			{
+				TRACE_PRINT1("EnumInterface: executing, strGuid = %s.", (TCHAR*)strGuid);
+				nstrWlanAdapterGuids.push_back((TCHAR*)strGuid);
+				RpcStringFree(&strGuid);
+			}
+		}
+		HANDLE hHeap = GetProcessHeap();
+		if (!hHeap)
+		{
+			TRACE_PRINT1("GetProcessHeap: error, can't free sInfo. errCode = 0x%08x.", GetLastError());
+		}
+		else
+		{
+			HeapFree(hHeap, 0, sInfo);
 		}
 	}
 
