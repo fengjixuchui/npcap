@@ -92,11 +92,6 @@
 #ifndef __PACKET_INCLUDE______
 #define __PACKET_INCLUDE______
 
-#ifdef _X86_
-#define NTKERNEL	///< Forces the compilation of the jitter with kernel calls
-#include "jitter.h"
-#endif
-
 #include "win_bpf.h"
 
 #define FILTER_ACQUIRE_LOCK(_pLock, DispatchLevel) NdisAcquireSpinLock(_pLock)
@@ -365,10 +360,6 @@ typedef struct _OPEN_INSTANCE
 											///< from the NIC driver is stored in two non-consecutive buffers. In normal situations
 											///< the filtering routine created by the JIT compiler and pointed by the next field
 											///< is used. See \ref NPF for details on the filtering process.
-#ifdef _X86_
-	JIT_BPF_Filter*			Filter;			///< Pointer to the native filtering function created by the jitter.
-	///< See BPF_jitter() for details.
-#endif //_X86_
 	UINT					MinToCopy;		///< Minimum amount of data in the circular buffer that unlocks a read. Set with the
 											///< BIOCSMINTOCOPY IOCTL.
 	LARGE_INTEGER			TimeOut;		///< Timeout after which a read is released, also if the amount of data in the buffer is
@@ -419,6 +410,8 @@ typedef struct _OPEN_INSTANCE
 
 	OPEN_STATE OpenStatus;
 	NDIS_SPIN_LOCK			OpenInUseLock;
+	ULONG TimestampMode;
+	struct timeval start; // Time synchronization of QPC with last boot
 
 } 
 OPEN_INSTANCE, *POPEN_INSTANCE;
@@ -448,7 +441,6 @@ struct PacketHeader
 };
 
 extern ULONG g_NCpu;
-extern struct time_conv G_Start_Time; // from openclos.c
 
 #define TRANSMIT_PACKETS 256	///< Maximum number of packets in the transmit packet pool. This value is an upper bound to the number
 ///< of packets that can be transmitted at the same time or with a single call to NdisSendPackets.
@@ -579,17 +571,6 @@ FILTER_OID_REQUEST NPF_OidRequest;
 FILTER_CANCEL_OID_REQUEST NPF_CancelOidRequest;
 
 FILTER_OID_REQUEST_COMPLETE NPF_OidRequestComplete;
-
-/*!
-  \brief Callback for NDIS StatusHandler. Not used by NPF
-*/
-FILTER_STATUS NPF_Status;
-// VOID
-// NPF_Status(
-// 	NDIS_HANDLE             FilterModuleContext,
-// 	PNDIS_STATUS_INDICATION StatusIndication
-// 	);
-
 
 /*!
   \brief Device PNP event handler.

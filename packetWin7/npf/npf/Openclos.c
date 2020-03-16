@@ -108,13 +108,7 @@ static
 VOID
 NPF_ReleaseFilterModuleResources(PNPCAP_FILTER_MODULE pFiltMod);
 
-/// Global start time. Used as an absolute reference for timestamp conversion.
-struct time_conv G_Start_Time =
-{
-	0, {0, 0},
-};
-
-ULONG g_NumOpenedInstances = 0;
+ULONG g_NumLoopbackInstances = 0;
 
 extern SINGLE_LIST_ENTRY g_arrFiltMod; //Adapter filter module list head, each list item is a group head.
 extern NDIS_SPIN_LOCK g_FilterArrayLock; //The lock for adapter filter module list.
@@ -248,10 +242,11 @@ NPF_OpenAdapter(
 	{
 		// Can't find the adapter from the global open array.
 		TRACE_MESSAGE1(PACKET_DEBUG_LOUD,
-			"NPF_GetOpenByAdapterName error, pFiltMod=NULL, AdapterName=%ws",
+			"NPF_GetFilterModuleByAdapterName error, pFiltMod=NULL, AdapterName=%ws",
 			IrpSp->FileObject->FileName.Buffer);
 
 		Irp->IoStatus.Status = STATUS_NDIS_INTERFACE_NOT_FOUND;
+		Irp->IoStatus.Information = FILE_DOES_NOT_EXIST;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
 		TRACE_EXIT();
 		return STATUS_NDIS_INTERFACE_NOT_FOUND;
@@ -260,7 +255,7 @@ NPF_OpenAdapter(
 	if (NPF_StartUsingBinding(pFiltMod) == FALSE)
 	{
 		TRACE_MESSAGE1(PACKET_DEBUG_LOUD,
-			"NPF_GetOpenByAdapterName error, AdapterName=%ws",
+			"NPF_StartUsingBinding error, AdapterName=%ws",
 			IrpSp->FileObject->FileName.Buffer);
 
 		Irp->IoStatus.Status = STATUS_NDIS_OPEN_FAILED;
@@ -272,12 +267,12 @@ NPF_OpenAdapter(
 	// Create a group child adapter object from the head adapter.
 	Open = NPF_CreateOpenObject();
 	if (Open == NULL)
-  {
+	{
 		Irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
-    TRACE_EXIT();
-    return STATUS_INSUFFICIENT_RESOURCES;
-  }
+		TRACE_EXIT();
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
 	Open->pFiltMod = pFiltMod;
 
 #ifdef HAVE_WFP_LOOPBACK_SUPPORT
@@ -324,6 +319,7 @@ NPF_OpenAdapter(
 		}
 
 		Status = STATUS_SUCCESS;
+		InterlockedIncrement(&g_NumLoopbackInstances);
 	}
 #endif
 
@@ -370,19 +366,17 @@ NPF_OpenAdapter_End:;
 	// complete the open
 	//
 	TRACE_MESSAGE1(PACKET_DEBUG_LOUD, "Open = %p\n", Open);
-	localNumOpenedInstances = InterlockedIncrement(&g_NumOpenedInstances);
-	TRACE_MESSAGE1(PACKET_DEBUG_LOUD, "Opened Instances: %u", localNumOpenedInstances);
 
 	// Get the absolute value of the system boot time.
 	// This is used for timestamp conversion.
-	TIME_SYNCHRONIZE(&G_Start_Time);
+	TIME_SYNCHRONIZE(&Open->start, Open->TimestampMode);
 
 	NPF_AddToGroupOpenArray(Open, pFiltMod);
 
 	NPF_StopUsingBinding(pFiltMod);
 
 	Irp->IoStatus.Status = Status;
-	Irp->IoStatus.Information = 0;
+	Irp->IoStatus.Information = FILE_OPENED;
 	IoCompleteRequest(Irp, IO_NO_INCREMENT);
 
 	TRACE_EXIT();
@@ -477,18 +471,6 @@ NPF_ReleaseOpenInstanceResources(
 		ExFreePool(pOpen->bpfprogram);
 		pOpen->bpfprogram = NULL;
 	}
-
-	//
-	// Jitted filters are supported on x86 (32bit) only
-	//
-#ifdef _X86_
-	// Free the jitted filter if it's present
-	if (pOpen->Filter != NULL)
-	{
-		BPF_Destroy_JIT_Filter(pOpen->Filter);
-		pOpen->Filter = NULL;
-	}
-#endif //_X86_
 
 	//
 	// Dereference the read event.
@@ -1038,22 +1020,14 @@ NPF_Cleanup(
 	//
 	NPF_ReleaseOpenInstanceResources(Open);
 
-	//	IrpSp->FileObject->FsContext = NULL;
-
-	//
-	// Decrease the counter of open instances
-	//
-	localNumOpenInstances = InterlockedDecrement(&g_NumOpenedInstances);
-	TRACE_MESSAGE1(PACKET_DEBUG_LOUD, "Opened Instances: %u", localNumOpenInstances);
-
-	if (localNumOpenInstances == 0)
+	if (InterlockedDecrement(&g_NumLoopbackInstances) == 0)
 	{
-		//
-		// Force a synchronization at the next NPF_Open().
-		// This hopefully avoids the synchronization issues caused by hibernation or standby.
-		//
-		TIME_DESYNCHRONIZE(&G_Start_Time);
+		// No more loopback handles open. Release WFP resources
+		NPF_UnregisterCallouts();
+		NPF_FreeInjectionHandles();
 	}
+
+	//	IrpSp->FileObject->FsContext = NULL;
 
 	Status = STATUS_SUCCESS;
 
@@ -1282,7 +1256,11 @@ NPF_EqualAdapterName(
 
 //-------------------------------------------------------------------
 
-#define PUNICODE_CONTAINS(a, b, byteoffset) (sizeof(b) == RtlCompareMemory(a->Buffer + byteoffset/sizeof(WCHAR), b, sizeof(b)))
+/* Ensure string "a" is long enough to contain "b" after the offset.
+ * Length does not include the null terminator, so account for that with sizeof(WCHAR).
+ * Then compare memory. Length is length in bytes, but buffer is a PWCHAR.
+ */
+#define PUNICODE_CONTAINS(a, b, byteoffset) (a->Length >= byteoffset + sizeof(b) - sizeof(WCHAR) && sizeof(b) == RtlCompareMemory(a->Buffer + byteoffset/sizeof(WCHAR), b, sizeof(b)))
 PNPCAP_FILTER_MODULE
 NPF_GetFilterModuleByAdapterName(
 	PNDIS_STRING pAdapterName
@@ -1456,6 +1434,7 @@ NPF_CreateOpenObject()
 	// Initialize the open instance
 	//
 	//Open->BindContext = NULL;
+	Open->TimestampMode = g_TimestampMode;
 	Open->bpfprogram = NULL;	//reset the filter
 	Open->mode = MODE_CAPT;
 	Open->Nbytes.QuadPart = 0;
@@ -1966,9 +1945,11 @@ NPF_Restart(
 
 	TRACE_ENTER();
 
-	TIME_DESYNCHRONIZE(&G_Start_Time);
-	TIME_SYNCHRONIZE(&G_Start_Time);
-
+	if (RestartParameters == NULL)
+	{
+		// Can't validate, but probably fine. Also, I don't think this is possible.
+		return NDIS_STATUS_SUCCESS;
+	}
 
 	NdisAcquireSpinLock(&pFiltMod->AdapterHandleLock);
 	ASSERT(pFiltMod->AdapterBindingStatus == FilterPaused);
@@ -1979,13 +1960,14 @@ NPF_Restart(
 		goto NPF_Restart_End;
 	}
 
-	do {
+	while (Curr) {
 		if (Curr->Oid == OID_GEN_MINIPORT_RESTART_ATTRIBUTES) {
 			GenAttr = (PNDIS_RESTART_GENERAL_ATTRIBUTES) Curr->Data;
 			pFiltMod->MaxFrameSize = GenAttr->MtuSize;
 			break;
 		}
-	} while (Curr = Curr->Next);
+		Curr = Curr->Next;
+	}
 
 
 NPF_Restart_End:
@@ -2339,51 +2321,6 @@ Arguments:
 	NdisFOidRequestComplete(pFiltMod->AdapterHandle, OriginalRequest, Status);
 
 	TRACE_EXIT();
-}
-
-//-------------------------------------------------------------------
-
-_Use_decl_annotations_
-VOID
-NPF_Status(
-	NDIS_HANDLE             FilterModuleContext,
-	PNDIS_STATUS_INDICATION StatusIndication
-	)
-/*++
-
-Routine Description:
-
-	Status indication handler
-
-Arguments:
-
-	FilterModuleContext     - our filter context
-	StatusIndication        - the status being indicated
-
-NOTE: called at <= DISPATCH_LEVEL
-
-  FILTER driver may call NdisFIndicateStatus to generate a status indication to
-  all higher layer modules.
-
---*/
-{
-	PNPCAP_FILTER_MODULE pFiltMod = (PNPCAP_FILTER_MODULE) FilterModuleContext;
-
-// 	TRACE_ENTER();
-// 	IF_LOUD(DbgPrint("NPF: Status Indication\n");)
-
-	IF_LOUD(DbgPrint("status %x\n", StatusIndication->StatusCode);)
-
-	//
-	// The filter may do processing on the status indication here, including
-	// intercepting and dropping it entirely.  However, the sample does nothing
-	// with status indications except pass them up to the higher layer.  It is
-	// more efficient to omit the FilterStatus handler entirely if it does
-	// nothing, but it is included in this sample for illustrative purposes.
-	//
-	NdisFIndicateStatus(pFiltMod->AdapterHandle, StatusIndication);
-
-/*	TRACE_EXIT();*/
 }
 
 //-------------------------------------------------------------------

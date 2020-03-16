@@ -246,7 +246,7 @@ NPF_Read(
 
 			//fill the bpf header for this packet
 			header = (struct bpf_hdr *)CurrBuff;
-			GET_TIME(&header->bh_tstamp, &G_Start_Time);
+			GET_TIME(&header->bh_tstamp, &Open->start, Open->TimestampMode);
 
 #ifdef NPCAP_KDUMP
 			if (Open->mode & MODE_DUMP)
@@ -820,41 +820,11 @@ NPF_TapExForEachOpen(
 			{
 
 
-				//
-				// the jit filter is available on x86 (32 bit) only
-				//
-#if 0
-				/* BPF JIT does not work with NET_BUFFER structures, so disabling it.
-				 * If we are going to re-enable it, we will either have to always copy the
-				 * packet into a buffer prior to invoking the filter, or we will have to
-				 * rewrite the jitter to emit code that can deal with MDL chains (unlikely).
-				 */
-#ifdef _X86_
-
-				if (Open->Filter != NULL)
-				{
-					if (Open->bpfprogram != NULL && Open->Filter->Function != NULL)
-					{
-						fres = Open->Filter->Function(
-							(PVOID)HeaderBuffer,
-							PacketSize + HeaderBufferSize,
-							LookaheadBufferSize + HeaderBufferSize);
-					}
-					else
-					{
-						fres = -1;
-					}
-				}
-				else
-#endif //_X86_
-#endif //0
-				{
-					fres = bpf_filter((struct bpf_insn *)(Open->bpfprogram),
+				fres = bpf_filter((struct bpf_insn *)(Open->bpfprogram),
 						NET_BUFFER_FIRST_MDL(pNetBuf),
 						Offset,
 						TotalPacketSize);
-					IF_LOUD(DbgPrint("\nFirst MDL length = %d, Packet Size = %d, fres = %d\n", MmGetMdlByteCount(NET_BUFFER_FIRST_MDL(pNetBuf)), TotalPacketSize, fres);)
-				}
+				IF_LOUD(DbgPrint("\nFirst MDL length = %d, Packet Size = %d, fres = %d\n", MmGetMdlByteCount(NET_BUFFER_FIRST_MDL(pNetBuf)), TotalPacketSize, fres);)
 
 
 				NdisReleaseSpinLock(&Open->MachineLock);
@@ -972,7 +942,7 @@ NPF_TapExForEachOpen(
 
 					Header = (struct PacketHeader *)(LocalData->Buffer + LocalData->P);
 					LocalData->Accepted++;
-					GET_TIME(&Header->header.bh_tstamp, &G_Start_Time);
+					GET_TIME(&Header->header.bh_tstamp, &Open->start, Open->TimestampMode);
 					Header->SN = InterlockedIncrement(&Open->WriterSN) - 1;
 
 					// DbgPrint("MDL %d\n", BufferLength);

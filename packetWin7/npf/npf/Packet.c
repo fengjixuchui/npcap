@@ -92,6 +92,7 @@
 #include "win_bpf.h"
 #include "ioctls.h"
 
+#include "..\..\..\version.h"
 #include "..\..\..\Common\WpcapNames.h"
 
 #ifdef ALLOC_PRAGMA
@@ -141,7 +142,7 @@ ULONG g_AdminOnlyMode = 0;
 ULONG g_DltNullMode = 0;
 ULONG g_Dot11SupportMode = 0;
 ULONG g_VlanSupportMode = 0;
-ULONG g_TimestampMode = 0;
+ULONG g_TimestampMode = DEFAULT_TIMESTAMPMODE;
 
 ULONG g_NCpu;
 
@@ -205,6 +206,24 @@ My_KeGetCurrentProcessorNumber(
 	return Cpu;
 }
 
+typedef VOID (*KEQUERYSYSTEMTIMEPRECISE)(
+	PLARGE_INTEGER CurrentTime
+	);
+KEQUERYSYSTEMTIMEPRECISE g_My_KeQuerySystemTimePrecise = NULL;
+
+VOID My_KeQuerySystemTimePrecise(
+	PLARGE_INTEGER CurrentTime
+	)
+{
+	if (g_My_KeQuerySystemTimePrecise) // Windows 8 and newer
+	{
+		g_My_KeQuerySystemTimePrecise(CurrentTime);
+	}
+	else
+	{
+		KeQuerySystemTime(CurrentTime);
+	}
+}
 
 #ifdef NPCAP_READ_ONLY
 // For read-only Npcap, we want an explicit denial function for the Write call.
@@ -299,6 +318,9 @@ DriverEntry(
 		// Get the TimestampMode option. The meanings of its values is described in time_calls.h.
 		// If the registry key doesn't exist, we view it as TimestampMode=0, so the default "QueryPerformanceCounter" timestamp gathering method.
 		g_TimestampMode = NPF_GetRegistryOption_Integer(&parametersPath, &g_TimestampRegValueName);
+		if (!NPF_TimestampModeSupported(g_TimestampMode)) {
+			g_TimestampMode = DEFAULT_TIMESTAMPMODE;
+		}
 
 #ifdef HAVE_WFP_LOOPBACK_SUPPORT
 		g_LoopbackSupportMode = NPF_GetRegistryOption_Integer(&parametersPath, &g_LoopbackSupportRegValueName);
@@ -550,8 +572,9 @@ NPF_registerLWF(
 
 	pFChars->MajorNdisVersion = NDIS_FILTER_MAJOR_VERSION; // NDIS version is 6.2 (Windows 7)
 	pFChars->MinorNdisVersion = NDIS_FILTER_MINOR_VERSION;
-	pFChars->MajorDriverVersion = 1; // Driver version is 1.0
-	pFChars->MinorDriverVersion = 0;
+	pFChars->MajorDriverVersion = WINPCAP_MINOR;
+	/* TODO: Stop using minor version numbers greater than 255 */
+	pFChars->MinorDriverVersion = WINPCAP_REV % MAXUCHAR;
 	pFChars->Flags = 0;
 
 	// Use different names for the WiFi driver.
@@ -584,7 +607,7 @@ NPF_registerLWF(
 	pFChars->ReceiveNetBufferListsHandler = NPF_TapEx;
 	pFChars->DevicePnPEventNotifyHandler = NPF_DevicePnPEventNotify;
 	pFChars->NetPnPEventHandler = NPF_NetPnPEvent;
-	pFChars->StatusHandler = NPF_Status;
+	pFChars->StatusHandler = NULL;
 	pFChars->CancelSendNetBufferListsHandler = NPF_CancelSendNetBufferLists;
 }
 
@@ -1152,16 +1175,6 @@ NPF_IoControl(
 				ExFreePool(TmpBPFProgram);
 			}
 
-			//
-			// Jitted filters are supported on x86 (32bit) only
-			//
-#ifdef _X86_
-			if (Open->Filter != NULL)
-			{
-				BPF_Destroy_JIT_Filter(Open->Filter);
-				Open->Filter = NULL;
-			}
-#endif // _X86_
 
 			insns = (IrpSp->Parameters.DeviceIoControl.InputBufferLength) / sizeof(struct bpf_insn);
 
@@ -1205,25 +1218,6 @@ NPF_IoControl(
 				SET_FAILURE_NOMEM();
 				break;
 			}
-
-			//
-			// At the moment the JIT compiler works on x86 (32 bit) only
-			//
-#ifdef _X86_
-			// Create the new JIT filter function
-			if (!IsExtendedFilter)
-			{
-				if ((Open->Filter = BPF_jitter(NewBpfProgram, cnt)) == NULL)
-				{
-					TRACE_MESSAGE(PACKET_DEBUG_LOUD, "Error jittering filter");
-
-					ExFreePool(TmpBPFProgram);
-
-					SET_FAILURE_UNSUCCESSFUL();
-					break;
-				}
-			}
-#endif //_X86_
 
 			//copy the program in the new buffer
 			RtlCopyMemory(TmpBPFProgram, NewBpfProgram, cnt * sizeof(struct bpf_insn));
@@ -1975,6 +1969,28 @@ NPF_IoControl(
 
 		break;
 
+	case BIOCSTIMESTAMPMODE:
+		if (IrpSp->Parameters.DeviceIoControl.InputBufferLength < sizeof(ULONG))
+		{
+			SET_FAILURE_BUFFER_SMALL();
+			break;
+		}
+
+		dim = *((PULONG)Irp->AssociatedIrp.SystemBuffer);
+		
+		// verify that the provided mode is supported
+		if (!NPF_TimestampModeSupported(dim))
+		{
+			SET_FAILURE_INVALID_REQUEST();
+			break;
+		} 
+
+		/* Reset buffer, since contents could have differing timestamps */
+		NPF_ResetBufferContents(Open);
+		Open->TimestampMode = dim;
+
+		SET_RESULT_SUCCESS(0);
+		break;
 
 	default:
 		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "Unknown IOCTL code");
