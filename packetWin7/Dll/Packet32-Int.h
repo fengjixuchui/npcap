@@ -86,10 +86,6 @@
 // opening of firewire adapters 
 #define FIREWIRE_SUBSTR L"1394"
 
-#ifdef HAVE_NPFIM_API
-#include "NpfImExt.h"
-#endif //HAVE_NPFIM_API
-
 #ifdef __MINGW32__
 #ifdef __MINGW64__
 #include <ntddndis.h>
@@ -136,7 +132,6 @@ ADAPTER_INFO, *PADAPTER_INFO;
 //
 // Internal functions
 //
-VOID PacketLoadLibrariesDynamically();
 void PacketPopulateAdaptersInfoList();
 BOOL PacketGetFileVersion(LPCTSTR FileName, PCHAR VersionBuff, UINT VersionBuffLen);
 PADAPTER_INFO PacketFindAdInfo(PCHAR AdapterName);
@@ -159,7 +154,7 @@ HMODULE LoadLibrarySafe(LPCTSTR lpFileName);
 typedef PCHAR (*AirpcapGetLastErrorHandler)(PAirpcapHandle Handle);
 typedef BOOL (*AirpcapGetDeviceListHandler)(AirpcapDeviceDescription **AllDevsP, PCHAR Ebuf);		///< prototype used to dynamically load the dag dll
 typedef VOID (*AirpcapFreeDeviceListHandler)(AirpcapDeviceDescription *AllDevsP);					///< prototype used to dynamically load the dag dll
-typedef PAirpcapHandle (*AirpcapOpenHandler)(PCHAR DeviceName, PCHAR Ebuf);							///< prototype used to dynamically load the dag dll	
+typedef PAirpcapHandle (*AirpcapOpenHandler)(LPCSTR DeviceName, PCHAR Ebuf);							///< prototype used to dynamically load the dag dll	
 typedef VOID (*AirpcapCloseHandler)(PAirpcapHandle Handle);											///< prototype used to dynamically load the dag dll
 typedef BOOL (*AirpcapGetLinkTypeHandler)(PAirpcapHandle Handle, AirpcapLinkType* LinkLayer);		///< prototype used to dynamically load the dag dll
 typedef BOOL (*AirpcapSetKernelBufferHandler)(PAirpcapHandle Handle, ULONG Size);					///< prototype used to dynamically load the dag dll

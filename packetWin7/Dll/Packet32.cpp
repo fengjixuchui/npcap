@@ -97,10 +97,6 @@
 #include "Packet32-Int.h"
 #include "../npf/npf/ioctls.h"
 
-#ifdef HAVE_WANPACKET_API
-#include "wanpacket/wanpacket.h"
-#endif //HAVE_WANPACKET_API
-
 #include <map>
 using namespace std;
 
@@ -130,20 +126,13 @@ map<string, int> g_nbAdapterMonitorModes;							// The states for all the wirele
 #pragma message ("Compiling Packet.dll with support for AirPcap")
 #endif
 
-#ifdef HAVE_NPFIM_API
-#pragma message ("Compiling Packet.dll with support for NpfIm driver")
-#endif
-
 #ifdef HAVE_DAG_API
 #pragma message ("Compiling Packet.dll with support for DAG cards")
 #endif
 
-#ifdef HAVE_WANPACKET_API
-#pragma message ("Compiling Packet.dll with support for WanPacket (aka Dialup thru NetMon)")
-#endif
-
-#ifdef HAVE_IPHELPER_API
-#pragma message ("Compiling Packet.dll with support from IP helper API for API addresses")
+#if defined(HAVE_AIRPCAP_API) || defined(HAVE_DAG_API)
+#define LOAD_OPTIONAL_LIBRARIES
+VOID PacketLoadLibrariesDynamically();
 #endif
 
 #ifndef UNUSED
@@ -313,21 +302,13 @@ BOOL initWlanFunctions()
 	return bRet;
 }
 
-#ifdef HAVE_IPHELPER_API
-typedef ULONG (WINAPI *GAAHandler)(
-	_In_    ULONG                 Family,
-	_In_    ULONG                 Flags,
-	_In_    PVOID                 Reserved,
-	_Inout_ PIP_ADAPTER_ADDRESSES AdapterAddresses,
-	_Inout_ PULONG                SizePointer);
-GAAHandler g_GetAdaptersAddressesPointer = NULL;
-#endif // HAVE_IPHELPER_API
-
+#ifdef LOAD_OPTIONAL_LIBRARIES
 //
 // Dynamic dependencies variables and declarations
 //
 volatile LONG g_DynamicLibrariesLoaded = 0;
 HANDLE g_DynamicLibrariesMutex;
+#endif
 
 #ifdef HAVE_AIRPCAP_API
 // We load dinamically the dag library in order link it only when it's present on the system
@@ -990,14 +971,6 @@ BOOL APIENTRY DllMain(HANDLE DllHandle, DWORD Reason, LPVOID lpReserved)
 
 		TRACE_PRINT("************Packet32: DllMain************");
 
-#if 0
-#ifdef WPCAP_OEM
-#ifdef HAVE_WANPACKET_API
-		LoadNdisNpp(Reason);
-#endif // HAVE_WANPACKET_API
-#endif // WPCAP_OEM 
-#endif
-
 #ifdef _DEBUG_TO_FILE
 		PacketDumpRegistryKey("HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\" NPF_DRIVER_NAME,"npf.reg");
 		
@@ -1014,8 +987,10 @@ BOOL APIENTRY DllMain(HANDLE DllHandle, DWORD Reason, LPVOID lpReserved)
 		// Create the mutex that will protect the adapter information list
 		g_AdaptersInfoMutex = CreateMutex(NULL, FALSE, NULL);
 		
+#ifdef LOAD_OPTIONAL_LIBRARIES
 		// Create the mutex that will protect the PacketLoadLibrariesDynamically() function		
 		g_DynamicLibrariesMutex = CreateMutex(NULL, FALSE, NULL);
+#endif
 
 		//
 		// Retrieve packet.dll version information from the file
@@ -1083,6 +1058,7 @@ BOOL APIENTRY DllMain(HANDLE DllHandle, DWORD Reason, LPVOID lpReserved)
 }
 
 
+#ifdef LOAD_OPTIONAL_LIBRARIES
 /*! 
   \brief This function is used to dynamically load some of the libraries winpcap depends on, 
    and that are not guaranteed to be in the system
@@ -1093,10 +1069,6 @@ BOOL APIENTRY DllMain(HANDLE DllHandle, DWORD Reason, LPVOID lpReserved)
 */
 VOID PacketLoadLibrariesDynamically()
 {
-#ifdef HAVE_IPHELPER_API
-	HMODULE IPHMod;
-#endif // HAVE_IPHELPER_API
-
 #ifdef HAVE_AIRPCAP_API
 	HMODULE AirpcapLib;
 #endif // HAVE_DAG_API	
@@ -1124,18 +1096,6 @@ VOID PacketLoadLibrariesDynamically()
 		return;
 	}
 
-	//
-	// Locate GetAdaptersAddresses dinamically since it is not present in Win2k
-	//
-
-#ifdef HAVE_IPHELPER_API
-	IPHMod = GetModuleHandle(TEXT("Iphlpapi"));
-	if (IPHMod != NULL)
-	{
-		g_GetAdaptersAddressesPointer = (GAAHandler) GetProcAddress(IPHMod ,"GetAdaptersAddresses");
-	}
-#endif // HAVE_IPHELPER_API
-	
 #ifdef HAVE_AIRPCAP_API
 	/* We dinamically load the airpcap library in order link it only when it's present on the system */
 	if((AirpcapLib =  LoadLibrarySafe(TEXT("airpcap.dll"))) == NULL)
@@ -1208,14 +1168,6 @@ VOID PacketLoadLibrariesDynamically()
 	}
 #endif /* HAVE_DAG_API */
 
-#ifdef HAVE_NPFIM_API
-	if (LoadNpfImDll() == FALSE)
-	{
-		TRACE_PRINT("Failed loading NpfIm extension");
-	}
-#endif //HAVE_NPFIM_API
-
-
 	//
 	// Done. Release the mutex and return
 	//
@@ -1224,6 +1176,7 @@ VOID PacketLoadLibrariesDynamically()
 	TRACE_EXIT();
 	return;
 }
+#endif
 
 /*
 BOOLEAN QueryWinPcapRegistryStringA(CHAR *SubKeyName,
@@ -2085,69 +2038,6 @@ LPADAPTER PacketOpenAdapterNPF(LPCSTR AdapterNameA)
 	return NULL;
 }
 
-#ifdef HAVE_WANPACKET_API
-static LPADAPTER PacketOpenAdapterWanPacket(LPCSTR AdapterName)
-{
-	LPADAPTER lpAdapter = NULL;
-	DWORD dwLastError = ERROR_SUCCESS;
-
-	TRACE_ENTER();
-
-	TRACE_PRINT("Opening a NDISWAN adapter...");
-
-	do
-	{
-		//
-		// This is a wan adapter. Open it using the netmon API
-		//			
-		lpAdapter = (LPADAPTER) GlobalAllocPtr(GMEM_MOVEABLE | GMEM_ZEROINIT,
-			sizeof(ADAPTER));
-
-		if (lpAdapter == NULL)
-		{
-			TRACE_PRINT("GlobalAlloc failed allocating memory for the ADAPTER structure. Failing (BAD_UNIT).");
-			dwLastError = ERROR_NOT_ENOUGH_MEMORY;
-			break;
-		}
-
-		lpAdapter->Flags = INFO_FLAG_NDISWAN_ADAPTER;
-
-		TRACE_PRINT("Trying to open the Wan Adapter through WanPacket.dll...");
-
-		// Open the adapter
-		lpAdapter->pWanAdapter = WanPacketOpenAdapter();
-
-		if (lpAdapter->pWanAdapter == NULL)
-		{
-			TRACE_PRINT("WanPacketOpenAdapter failed. Failing. (BAD_UNIT)");
-			dwLastError = ERROR_BAD_UNIT;
-			break;
-		}
-
-		StringCchCopyA(lpAdapter->Name, ADAPTER_NAME_LENGTH, AdapterName);
-
-		lpAdapter->ReadEvent = WanPacketGetReadEvent(lpAdapter->pWanAdapter);
-
-		TRACE_PRINT("Successfully opened the Wan Adapter.");
-
-	}while(FALSE);
-
-	if (dwLastError == ERROR_SUCCESS)
-	{
-		TRACE_EXIT();
-		return lpAdapter;
-	}
-	else
-	{
-		if (lpAdapter != NULL) GlobalFree(lpAdapter);
-		
-		TRACE_EXIT();
-		SetLastError(dwLastError);
-		return NULL;
-	}
-}
-#endif //HAVE_WANPACKET_API
-
 /*! 
   \brief Opens an adapter using the aircap dll.
   \param AdapterName A string containing the name of the device to open. 
@@ -2204,45 +2094,6 @@ static LPADAPTER PacketOpenAdapterAirpcap(LPCSTR AdapterName)
 	return lpAdapter;
 }
 #endif // HAVE_AIRPCAP_API
-
-
-#ifdef HAVE_NPFIM_API
-static LPADAPTER PacketOpenAdapterNpfIm(LPCSTR AdapterName)
-{
-    LPADAPTER lpAdapter;
-
-	TRACE_ENTER();
-
-	lpAdapter = (LPADAPTER) GlobalAllocPtr(GMEM_MOVEABLE | GMEM_ZEROINIT,
-		sizeof(ADAPTER));
-	if (lpAdapter == NULL)
-	{
-		TRACE_EXIT();
-		return NULL;
-	}
-
-	//
-	// Indicate that this is a aircap card
-	//
-	lpAdapter->Flags = INFO_FLAG_NPFIM_DEVICE;
-		  
-	//
-	// Open the adapter
-	//
-
-	if (g_NpfImHandlers.NpfImOpenDevice(AdapterName, (NPF_IM_DEV_HANDLE*)&lpAdapter->NpfImHandle) == FALSE)
-	{
-		GlobalFreePtr(lpAdapter);
-		TRACE_EXIT();
-		return NULL;					
-	}
-		  				
-	StringCchCopyA(lpAdapter->Name, ADAPTER_NAME_LENGTH, AdapterName);
-	
-	TRACE_EXIT();
-	return lpAdapter;
-}
-#endif // HAVE_NpfIm_API
 
 
 /*! 
@@ -2519,10 +2370,12 @@ LPADAPTER PacketOpenAdapter(PCHAR AdapterNameWA)
 	
 	TRACE_PRINT2("Packet DLL version %hs, Driver version %hs", PacketLibraryVersion, PacketDriverVersion);
 
+#ifdef LOAD_OPTIONAL_LIBRARIES
 	//
 	// Check the presence on some libraries we rely on, and load them if we found them
 	//
 	PacketLoadLibrariesDynamically();
+#endif
 
 	//
 	// Ugly heuristic to detect if the adapter is ASCII
@@ -2613,20 +2466,6 @@ LPADAPTER PacketOpenAdapter(PCHAR AdapterNameWA)
 
 		TRACE_PRINT("Adapter found in our list. Check adapter type and see if it's actually supported.");
 
-#ifdef HAVE_WANPACKET_API
-		if(TAdInfo->Flags == INFO_FLAG_NDISWAN_ADAPTER)
-		{
-			lpAdapter = PacketOpenAdapterWanPacket(AdapterNameA);
-
-			if (lpAdapter == NULL)
-			{
-				dwLastError = GetLastError();
-			}
-
-			break;
-		}
-#endif //HAVE_WANPACKET_API
-
 #ifdef HAVE_AIRPCAP_API
 		if(TAdInfo->Flags == INFO_FLAG_AIRPCAP_CARD)
 		{
@@ -2657,37 +2496,6 @@ LPADAPTER PacketOpenAdapter(PCHAR AdapterNameWA)
 			break;
 		}
 #endif // HAVE_AIRPCAP_API
-
-#ifdef HAVE_NPFIM_API
-		if(TAdInfo->Flags == INFO_FLAG_NPFIM_DEVICE)
-		{
-			//
-			// This is an airpcap card. Open it using the airpcap api
-			//								
-			lpAdapter = PacketOpenAdapterNpfIm(AdapterNameA);
-
-			if(lpAdapter == NULL)
-			{
-				dwLastError = ERROR_BAD_UNIT;
-				break;
-			}
-
-			//
-			// NpfIm provides a read event
-			//
-			if(!g_NpfImHandlers.NpfImGetCaptureReadEvent((NPF_IM_DEV_HANDLE)lpAdapter->NpfImHandle, &lpAdapter->ReadEvent))
-			{
-				dwLastError = GetLastError();
-				PacketCloseAdapter(lpAdapter);
-			}
-			else
-			{
-				dwLastError = ERROR_SUCCESS;
-			}
-
-			break;
-		}
-#endif // HAVE_NPFIM_API
 
 #ifdef HAVE_DAG_API
 		if(TAdInfo->Flags == INFO_FLAG_DAG_CARD)
@@ -2781,17 +2589,6 @@ VOID PacketCloseAdapter(LPADAPTER lpAdapter)
 		return;
 	}
 
-#ifdef HAVE_WANPACKET_API
-	if (lpAdapter->Flags == INFO_FLAG_NDISWAN_ADAPTER)
-	{
-		TRACE_PRINT("Closing a WAN adapter through WanPacket...");
-		WanPacketCloseAdapter(lpAdapter->pWanAdapter);
-		GlobalFreePtr(lpAdapter);
-		TRACE_EXIT();
-		return;
-	}
-#endif
-
 #ifdef HAVE_AIRPCAP_API
 	if(lpAdapter->Flags == INFO_FLAG_AIRPCAP_CARD)
 		{
@@ -2801,16 +2598,6 @@ VOID PacketCloseAdapter(LPADAPTER lpAdapter)
 			return;
 		}
 #endif // HAVE_AIRPCAP_API
-
-#ifdef HAVE_NPFIM_API
-	if(lpAdapter->Flags == INFO_FLAG_NPFIM_DEVICE)
-	{
-		g_NpfImHandlers.NpfImCloseDevice(lpAdapter->NpfImHandle);
-		GlobalFreePtr(lpAdapter);
-		TRACE_EXIT();
-		return;
-	}
-#endif
 
 #ifdef HAVE_DAG_API
 	if(lpAdapter->Flags & INFO_FLAG_DAG_FILE ||  lpAdapter->Flags & INFO_FLAG_DAG_CARD)
@@ -2953,16 +2740,6 @@ BOOLEAN PacketReceivePacket(LPADAPTER AdapterObject,LPPACKET lpPacket,BOOLEAN Sy
 	UNUSED(Sync);
 
 	TRACE_ENTER();
-#ifdef HAVE_WANPACKET_API
-	
-	if (AdapterObject->Flags == INFO_FLAG_NDISWAN_ADAPTER)
-	{
-		lpPacket->ulBytesReceived = WanPacketReceivePacket(AdapterObject->pWanAdapter, lpPacket->Buffer, lpPacket->Length);
-
-		TRACE_EXIT();
-		return TRUE;
-	}
-#endif //HAVE_WANPACKET_API
 
 #ifdef HAVE_AIRPCAP_API
 	if(AdapterObject->Flags == INFO_FLAG_AIRPCAP_CARD)
@@ -2980,7 +2757,7 @@ BOOLEAN PacketReceivePacket(LPADAPTER AdapterObject,LPPACKET lpPacket,BOOLEAN Sy
 		// g_PAirpcapRead always returns immediately.
 		//
 		res = (BOOLEAN)g_PAirpcapRead(AdapterObject->AirpcapAd, 
-				lpPacket->Buffer, 
+				(PUCHAR) lpPacket->Buffer, 
 				lpPacket->Length, 
 				&lpPacket->ulBytesReceived);
 
@@ -2988,24 +2765,6 @@ BOOLEAN PacketReceivePacket(LPADAPTER AdapterObject,LPPACKET lpPacket,BOOLEAN Sy
 		return res;
 	}
 #endif // HAVE_AIRPCAP_API
-
-#ifdef HAVE_NPFIM_API
-	if(AdapterObject->Flags == INFO_FLAG_NPFIM_DEVICE)
-	{
-		//
-		// Read the data.
-		// NpfImReceivePacket performs its own wait internally.
-		//
-	
-		res = (BOOLEAN)g_NpfImHandlers.NpfImReceivePackets(AdapterObject->NpfImHandle,
-				lpPacket->Buffer, 
-				lpPacket->Length, 
-				&lpPacket->ulBytesReceived);
-
-		TRACE_EXIT();
-		return res;
-	}
-#endif // HAVE_NPFIM_API
 
 #ifdef HAVE_DAG_API
 	if((AdapterObject->Flags & INFO_FLAG_DAG_CARD) || (AdapterObject->Flags & INFO_FLAG_DAG_FILE))
@@ -3078,7 +2837,7 @@ BOOLEAN PacketSendPacket(LPADAPTER AdapterObject,LPPACKET lpPacket,BOOLEAN Sync)
 	{
 		if(g_PAirpcapWrite)
 		{
-			Result = (BOOLEAN)g_PAirpcapWrite(AdapterObject->AirpcapAd, lpPacket->Buffer, lpPacket->Length);
+			Result = (BOOLEAN)g_PAirpcapWrite(AdapterObject->AirpcapAd, (PCHAR) lpPacket->Buffer, lpPacket->Length);
 			
 			TRACE_EXIT();
 			return Result;
@@ -3092,26 +2851,6 @@ BOOLEAN PacketSendPacket(LPADAPTER AdapterObject,LPPACKET lpPacket,BOOLEAN Sync)
 		}
 	}
 #endif // HAVE_AIRPCAP_API
-
-#ifdef HAVE_WANPACKET_API
-	if(AdapterObject->Flags == INFO_FLAG_NDISWAN_ADAPTER)
-	{
-		TRACE_PRINT("PacketSendPacket: packet sending not allowed on wan adapters");
-
-		TRACE_EXIT();
-		return FALSE;
-	}
-#endif // HAVE_WANPACKET_API
-		
-#ifdef HAVE_NPFIM_API
-	if(AdapterObject->Flags == INFO_FLAG_NPFIM_DEVICE)
-	{
-		TRACE_PRINT("PacketSendPacket: packet sending not allowed on NPFIM adapters");
-
-		TRACE_EXIT();
-		return FALSE;
-	}
-#endif //HAVE_NPFIM_API
 
 	if (AdapterObject->Flags == INFO_FLAG_NDIS_ADAPTER)
 	{
@@ -3176,24 +2915,6 @@ INT PacketSendPackets(LPADAPTER AdapterObject, PVOID PacketBuff, ULONG Size, BOO
 
 
 	TRACE_ENTER();
-
-#ifdef HAVE_WANPACKET_API
-	if(AdapterObject->Flags == INFO_FLAG_NDISWAN_ADAPTER)
-	{
-		TRACE_PRINT("PacketSendPackets: packet sending not allowed on wan adapters");
-		TRACE_EXIT();
-		return 0;
-	}
-#endif // HAVE_WANPACKET_API
-
-#ifdef HAVE_NPFIM_API
-	if(AdapterObject->Flags == INFO_FLAG_NPFIM_DEVICE)
-	{
-		TRACE_PRINT("PacketSendPackets: packet sending not allowed on npfim adapters");
-		TRACE_EXIT();
-		return 0;
-	}
-#endif // HAVE_NPFIM_API
 
 #ifdef HAVE_AIRPCAP_API
 	if(AdapterObject->Flags == INFO_FLAG_AIRPCAP_CARD)
@@ -3288,26 +3009,6 @@ BOOLEAN PacketSetMinToCopy(LPADAPTER AdapterObject,int nbytes)
 
 	TRACE_ENTER();
 	
-#ifdef HAVE_WANPACKET_API
-	if (AdapterObject->Flags == INFO_FLAG_NDISWAN_ADAPTER)
-	{
-		Result = WanPacketSetMinToCopy(AdapterObject->pWanAdapter, nbytes);
-
-		TRACE_EXIT();
-		return Result;
-	}
-#endif //HAVE_WANPACKET_API
-
-#ifdef HAVE_NPFIM_API
-	if(AdapterObject->Flags == INFO_FLAG_NPFIM_DEVICE)
-	{
-		Result = (BOOLEAN)g_NpfImHandlers.NpfImSetMinToCopy(AdapterObject->NpfImHandle, nbytes);
-
-		TRACE_EXIT();
-		return Result;
-	}
-#endif // HAVE_NPFIM_API
-	
 #ifdef HAVE_AIRPCAP_API
 	if(AdapterObject->Flags == INFO_FLAG_AIRPCAP_CARD)
 	{
@@ -3384,16 +3085,6 @@ BOOLEAN PacketSetMode(LPADAPTER AdapterObject,int mode)
 
    TRACE_ENTER();
 
-#ifdef HAVE_WANPACKET_API
-   if (AdapterObject->Flags == INFO_FLAG_NDISWAN_ADAPTER)
-   {
-	   Result = WanPacketSetMode(AdapterObject->pWanAdapter, mode);
-
-	   TRACE_EXIT();
-	   return Result;
-   }
-#endif // HAVE_WANPACKET_API
-   
 #ifdef HAVE_AIRPCAP_API
    if (AdapterObject->Flags == INFO_FLAG_AIRPCAP_CARD)
    {
@@ -3410,23 +3101,6 @@ BOOLEAN PacketSetMode(LPADAPTER AdapterObject,int mode)
 	   return Result;
    }
 #endif //HAVE_AIRPCAP_API
-
-#ifdef HAVE_NPFIM_API
-   if (AdapterObject->Flags == INFO_FLAG_NPFIM_DEVICE)
-   {
-	   if (mode == PACKET_MODE_CAPT)
-	   {
-		   Result = TRUE;
-	   }
-	   else
-	   {
-		   Result = FALSE;
-	   }
-
-	   TRACE_EXIT();
-	   return Result;
-   }
-#endif //HAVE_NPFIM_API
 
    if (AdapterObject->Flags == INFO_FLAG_NDIS_ADAPTER)
    {
@@ -3676,32 +3350,6 @@ BOOLEAN PacketSetReadTimeout(LPADAPTER AdapterObject,int timeout)
 
 	AdapterObject->ReadTimeOut = timeout;
 
-#ifdef HAVE_WANPACKET_API
-	if (AdapterObject->Flags == INFO_FLAG_NDISWAN_ADAPTER)
-	{
-		Result = WanPacketSetReadTimeout(AdapterObject->pWanAdapter,timeout);
-		
-		TRACE_EXIT();
-		return Result;
-	}
-#endif // HAVE_WANPACKET_API
-
-#ifdef HAVE_NPFIM_API
-	if (AdapterObject->Flags == INFO_FLAG_NPFIM_DEVICE)
-	{
-		//
-		// convert the timestamps to Windows like format (0 = immediate, -1(INFINITE) = infinite)
-		//
-		if (timeout == -1) timeout = 0;
-		else if (timeout == 0) timeout = INFINITE;
-        
-		Result = (BOOLEAN)g_NpfImHandlers.NpfImSetReadTimeout(AdapterObject->NpfImHandle, timeout);
-		
-		TRACE_EXIT();
-		return Result;
-	}
-#endif // HAVE_NPFIM_API
-
 #ifdef HAVE_AIRPCAP_API
 	//
 	// Timeout with AirPcap is handled at user level
@@ -3785,16 +3433,6 @@ BOOLEAN PacketSetBuff(LPADAPTER AdapterObject,int dim)
 
 	TRACE_ENTER();
 
-#ifdef HAVE_WANPACKET_API
-	if (AdapterObject->Flags == INFO_FLAG_NDISWAN_ADAPTER)
-	{
-        Result = WanPacketSetBufferSize(AdapterObject->pWanAdapter, dim);
-		
-		TRACE_EXIT();
-		return Result;
-	}
-#endif
-
 #ifdef HAVE_AIRPCAP_API
 	if(AdapterObject->Flags == INFO_FLAG_AIRPCAP_CARD)
 	{
@@ -3804,16 +3442,6 @@ BOOLEAN PacketSetBuff(LPADAPTER AdapterObject,int dim)
 		return Result;
 	}
 #endif // HAVE_AIRPCAP_API
-
-#ifdef HAVE_NPFIM_API
-	if(AdapterObject->Flags == INFO_FLAG_NPFIM_DEVICE)
-	{
-		Result = (BOOLEAN)g_NpfImHandlers.NpfImSetCaptureBufferSize(AdapterObject->NpfImHandle, dim);
-
-		TRACE_EXIT();
-		return Result;
-	}
-#endif // HAVE_NPFIM_API
 
 #ifdef HAVE_DAG_API
 	if(AdapterObject->Flags == INFO_FLAG_DAG_CARD)
@@ -3865,16 +3493,6 @@ BOOLEAN PacketSetBpf(LPADAPTER AdapterObject, struct bpf_program *fp)
 	
 	TRACE_ENTER();
 	
-#ifdef HAVE_WANPACKET_API
-	if (AdapterObject->Flags == INFO_FLAG_NDISWAN_ADAPTER)
-	{
-		Result = WanPacketSetBpfFilter(AdapterObject->pWanAdapter, (PUCHAR)fp->bf_insns, fp->bf_len * sizeof(struct bpf_insn));
-
-		TRACE_EXIT();
-		return Result;
-	}
-#endif
-
 #ifdef HAVE_AIRPCAP_API
 	if(AdapterObject->Flags == INFO_FLAG_AIRPCAP_CARD)
 	{
@@ -3886,18 +3504,6 @@ BOOLEAN PacketSetBpf(LPADAPTER AdapterObject, struct bpf_program *fp)
 		return Result;
 	}
 #endif // HAVE_AIRPCAP_API
-
-#ifdef HAVE_NPFIM_API
-	if(AdapterObject->Flags == INFO_FLAG_NPFIM_DEVICE)
-	{
-		Result = (BOOLEAN)g_NpfImHandlers.NpfImSetBpfFilter(AdapterObject->NpfImHandle,
-			fp->bf_insns,
-			fp->bf_len * sizeof(struct bpf_insn));
-
-		TRACE_EXIT();
-		return TRUE;
-	}
-#endif // HAVE_NPFIM_API
 
 #ifdef HAVE_DAG_API
 	if(AdapterObject->Flags & INFO_FLAG_DAG_CARD)
@@ -4075,40 +3681,6 @@ BOOLEAN PacketGetStats(LPADAPTER AdapterObject,struct bpf_stat *s)
 	}
 #endif // HAVE_AIRPCAP_API
 
-#ifdef HAVE_NPFIM_API
-	if(AdapterObject->Flags == INFO_FLAG_NPFIM_DEVICE)
-	{
-		ULONGLONG stats[7];
-		DWORD neededBytes;
-
-		Res = (BOOLEAN)g_NpfImHandlers.NpfImGetCaptureStatistics(AdapterObject->NpfImHandle, stats, sizeof(stats), &neededBytes);
-
-		if (Res)
-		{
-//			if (stats[NPFIM_CAPTURE_STATS_RECEIVED] < 0xFFFFFFFF)
-//				s->bs_capt = (UINT)stats[NPFIM_CAPTURE_STATS_RECEIVED];
-//			else
-//				s->bs_capt = 0xFFFFFFFF;
-
-			if (stats[NPFIM_CAPTURE_STATS_DROPPED_FILTER] < 0xFFFFFFFF)
-				s->bs_drop = (UINT)stats[NPFIM_CAPTURE_STATS_DROPPED_FILTER];
-			else
-				s->bs_drop = 0xFFFFFFFF;
-
-			if (stats[NPFIM_CAPTURE_STATS_ACCEPTED] < 0xFFFFFFFF)
-				s->bs_recv = (UINT)stats[NPFIM_CAPTURE_STATS_ACCEPTED];
-			else
-				s->bs_recv = 0xFFFFFFFF;
-			
-			s->ps_ifdrop = 0;
-		}
-
-		TRACE_EXIT();
-		return Res;
-	}
-#endif // HAVE_AIRPCAP_API
-
-
 #ifdef HAVE_DAG_API
 	if(AdapterObject->Flags & INFO_FLAG_DAG_CARD)
 	{
@@ -4135,21 +3707,6 @@ BOOLEAN PacketGetStats(LPADAPTER AdapterObject,struct bpf_stat *s)
 	}
 
 #endif // HAVE_DAG_API
-
-#ifdef HAVE_WANPACKET_API	
-	if ( AdapterObject->Flags == INFO_FLAG_NDISWAN_ADAPTER)
-	{
-			Res = WanPacketGetStats(AdapterObject->pWanAdapter, (PVOID)&tmpstat);
-
-			// Copy only the first two values retrieved from the driver
-			s->bs_recv = tmpstat.bs_recv;
-			s->bs_drop = tmpstat.bs_drop;
-		
-			TRACE_EXIT();
-			return Res;	
-	}
-
-#endif // HAVE_WANPACKET_API
 
 	if (AdapterObject->Flags == INFO_FLAG_NDIS_ADAPTER)
 	{
@@ -4221,16 +3778,6 @@ BOOLEAN PacketGetStatsEx(LPADAPTER AdapterObject,struct bpf_stat *s)
 	}
 #endif // HAVE_DAG_API
 
-#ifdef HAVE_WANPACKET_API
-	if(AdapterObject->Flags == INFO_FLAG_NDISWAN_ADAPTER)
-	{
-		Res = WanPacketGetStats(AdapterObject->pWanAdapter, (PVOID)&tmpstat);
-
-		TRACE_EXIT();
-		return Res;
-	}
-#endif // HAVE_WANPACKET_API
-
 #ifdef HAVE_AIRPCAP_API
 	if(AdapterObject->Flags == INFO_FLAG_AIRPCAP_CARD)
 	{
@@ -4301,29 +3848,9 @@ BOOLEAN PacketRequest(LPADAPTER  AdapterObject,BOOLEAN Set,PPACKET_OID_DATA  Oid
 
 	TRACE_ENTER();
 
-#ifdef HAVE_NPFIM_API
-	if(AdapterObject->Flags == INFO_FLAG_NPFIM_DEVICE)
-	{
-		if (Set)
-		{
-			TRACE_PRINT("PacketRequest SET not supported on NPFIM devices");
-			TRACE_EXIT();
-			return FALSE;
-		}
-
-		Result = (BOOLEAN)g_NpfImHandlers.NpfImIssueQueryOid(AdapterObject->NpfImHandle,
-			OidData->Oid,
-			OidData->Data,
-			&OidData->Length);
-
-		TRACE_EXIT();
-		return Result;
-	}
-#endif
-
 	if(AdapterObject->Flags != INFO_FLAG_NDIS_ADAPTER)
 	{
-		TRACE_PRINT("PacketRequest not supported on non-NPF/NPFIM adapters.");
+		TRACE_PRINT("PacketRequest not supported on non-NPF adapters.");
 		TRACE_EXIT();
 		return FALSE;
 	}
@@ -4387,21 +3914,6 @@ BOOLEAN PacketSetHwFilter(LPADAPTER  AdapterObject,ULONG Filter)
 	}
 #endif // HAVE_AIRPCAP_API
 
-#ifdef HAVE_NPFIM_API
-	if(AdapterObject->Flags == INFO_FLAG_NPFIM_DEVICE)
-	{
-		return TRUE;
-	}
-#endif // HAVE_NPFIM_API
-
-#ifdef HAVE_WANPACKET_API
-	if(AdapterObject->Flags == INFO_FLAG_NDISWAN_ADAPTER)
-	{
-		TRACE_EXIT();
-		return TRUE;
-	}
-#endif // HAVE_WANPACKET_API
-    
 	if (AdapterObject->Flags == INFO_FLAG_NDIS_ADAPTER)
 	{
 		OidData = (PPACKET_OID_DATA) GlobalAllocPtr(GMEM_MOVEABLE | GMEM_ZEROINIT, IoCtlBufferLength);
@@ -4466,10 +3978,12 @@ BOOLEAN PacketGetAdapterNames(PCHAR pStr, PULONG  BufferSize)
 	TRACE_PRINT1("PacketGetAdapterNames: BufferSize=%u", *BufferSize);
 
 
+#ifdef LOAD_OPTIONAL_LIBRARIES
 	//
 	// Check the presence on some libraries we rely on, and load them if we found them
 	//f
 	PacketLoadLibrariesDynamically();
+#endif
 
 	//d
 	// Create the adapter information list

@@ -87,11 +87,11 @@
 #define /*
  !define /**/ WINPCAP_MINOR				0
 #define /*
- !define /**/ WINPCAP_REV				9989
+ !define /**/ WINPCAP_REV				9990
 #define /*
- !define /**/ WINPCAP_BUILD				316
+ !define /**/ WINPCAP_BUILD				403
 #define /*
- !define /**/ WINPCAP_VER_STRING		"0.9989"
+ !define /**/ WINPCAP_VER_STRING		"0.9990"
 
 #define WINPCAP_WPCAP_STRING_VERSION WINPCAP_VER_STRING
 
@@ -117,7 +117,6 @@
  !endif /**/
 
 #define WINPCAP_COPYRIGHT_STRING 		"Copyright (c) 2020, Insecure.Com LLC.  All rights reserved."
-#define WINPCAP_WANPACKET_COPYRIGHT_STRING "Copyright (c) 2020, Insecure.Com LLC.  All rights reserved."
 #define WINPCAP_INSTALLERHELPER_COPYRIGHT_STRING "Copyright (c) 2020, Insecure.Com LLC.  All rights reserved."
 #define WINPCAP_RPCAPD_COPYRIGHT_STRING "Copyright (c) 2020, Insecure.Com LLC.  All rights reserved."
 

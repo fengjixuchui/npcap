@@ -21,9 +21,6 @@
     <ClCompile Include="..\netcfgapi.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="..\NpfImExt.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="..\Packet32.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -31,9 +28,6 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="..\..\npf\npf\win_bpf_filter.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="..\WanPacket\WanPacket.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -44,9 +38,6 @@
     <ClInclude Include="..\netcfgapi.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="..\NpfImExt.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="..\Packet32-Int.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -54,9 +45,6 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\strsafe.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="..\WanPacket\WanPacket.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

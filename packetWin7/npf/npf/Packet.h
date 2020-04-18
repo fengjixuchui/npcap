@@ -120,8 +120,6 @@ extern NDIS_HANDLE         FilterDriverObject;
 
 #define IMMEDIATE 1			///< Immediate timeout. Forces a read call to return immediately.
 
-#define NDIS_FLAGS_SKIP_LOOPBACK_W2K		0x400 ///< This is an undocumented flag for NdisSetPacketFlags() that allows to disable loopback reception.
-
 #ifdef NPCAP_KDUMP
 // The following definitions are used to provide compatibility
 // of the dump files with the ones of libpcap
@@ -242,9 +240,8 @@ typedef struct _INTERNAL_REQUEST
 */
 typedef struct _DEVICE_EXTENSION
 {
-	NDIS_STRING	AdapterName;			///< Name of the adapter.
 	PWSTR		ExportString;			///< Name of the exported device, i.e. name that the applications will use
-										///< to open this adapter through WinPcap.
+										///< to open this adapter through Packet.dll.
 } DEVICE_EXTENSION, *PDEVICE_EXTENSION;
 
 /*!
@@ -392,7 +389,7 @@ typedef struct _OPEN_INSTANCE
 											///< reached.
 #endif
 
-	NDIS_SPIN_LOCK			MachineLock;	///< SpinLock that protects the BPF filter and the TME engine, if in use.
+	NDIS_SPIN_LOCK			MachineLock;	///< SpinLock that protects the BPF filter while in use.
 	//
 	// KAFFINITY is used as a bit mask for the affinity in the system. So on every supported OS is big enough for all the CPUs on the system (32 bits on x86, 64 on x64?).
 	// We use its size to compute the max number of CPUs.
@@ -994,22 +991,23 @@ DRIVER_DISPATCH NPF_CloseAdapter;
 
 
 /*!
-  \brief Callback invoked by NPF_TapEx() when a packet arrives from the network.
-  \param Open Pointer to an OPEN_INSTANCE structure to which the packets are destined.
+  \brief Capture a NBL for all OpenInstances on an adapter.
+  \param pFiltMod Pointer to a filter module where the packets should be captured
   \param pNetBufferLists A List of NetBufferLists to receive.
+  \param pOpenOriginating A pointer to the OpenInstance that originated/injected these packets so SkipSentPackets can be honored. NULL if not applicable.
 
-  NPF_TapExForEachOpen() is called by the underlying NIC for every incoming packet. It is the most important and one of
+  NPF_DoTap() is called for every incoming and outgoing packet. It is the most important and one of
   the most complex functions of NPF: it executes the filter, runs the statistical engine (if the instance is in
-  statistical mode), gathers the timestamp, moves the packet in the buffer. NPF_tap() is the only function,
+  statistical mode), gathers the timestamp, moves the packet in the buffer. NPF_DoTap() is the only function,
   along with the filtering ones, that is executed for every incoming packet, therefore it is carefully
   optimized.
 */
 VOID
-NPF_TapExForEachOpen(
-	IN POPEN_INSTANCE Open,
-	IN PNET_BUFFER_LIST pNetBufferLists
+NPF_DoTap(
+	PNPCAP_FILTER_MODULE pFiltMod,
+	PNET_BUFFER_LIST NetBufferLists,
+	POPEN_INSTANCE pOpenOriginating
 	);
-
 
 /*!
   \brief Handles the IOCTL calls.
