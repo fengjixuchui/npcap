@@ -215,6 +215,61 @@ NPF_CloseBinding(
 	NdisReleaseSpinLock(&pFiltMod->AdapterHandleLock);
 }
 
+VOID
+NPF_WriterThread(
+		_In_ PVOID Context
+		)
+{
+	PNPCAP_FILTER_MODULE pFiltMod = Context;
+
+	PLIST_ENTRY RequestListEntry = NULL;
+	PNPF_WRITER_REQUEST pReq = NULL;
+	KIRQL oldIrql;
+
+	KeSetPriorityThread(KeGetCurrentThread(), LOW_REALTIME_PRIORITY );
+
+	for (;;)
+	{
+		// Wait for work to appear
+		KeWaitForSingleObject(&pFiltMod->WriterSemaphore,
+				Executive,
+				KernelMode,
+				FALSE,
+				NULL);
+		// Check if we're being told to die
+		if (pFiltMod->WriterShouldStop) {
+			// Clean up!
+ 			NPF_PurgeRequests(pFiltMod, NULL, NULL, NULL);
+			PsTerminateSystemThread( STATUS_SUCCESS );
+		}
+
+		// Grab the next work request
+		RequestListEntry = ExInterlockedRemoveHeadList(&pFiltMod->WriterRequestList, &pFiltMod->WriterRequestLock);
+		if (RequestListEntry == NULL) {
+			// That's weird, no work to do.
+			continue;
+		}
+		pReq = CONTAINING_RECORD(RequestListEntry, NPF_WRITER_REQUEST, WriterRequestEntry);
+		switch (pReq->FunctionCode)
+		{
+			case NPF_WRITER_WRITE:
+				NPF_FillBuffer(pReq->pOpen,
+					pReq->pNetBuffer,
+					&pReq->BpfHeader,
+					pReq->pRadiotapHeader);
+				break;
+			case NPF_WRITER_FREE_RADIOTAP:
+				NdisFreeMemory(pReq->pRadiotapHeader, SIZEOF_RADIOTAP_BUFFER, 0);
+				break;
+			case NPF_WRITER_FREE_NBL:
+				NdisFreeCloneNetBufferList(pReq->pNBL, 0);
+				break;
+			default:
+				break;
+		}
+		NdisFreeMemory(pReq, sizeof(NPF_WRITER_REQUEST), 0);
+	}
+}
 //-------------------------------------------------------------------
 
 NTSTATUS
@@ -446,6 +501,9 @@ NPF_CloseOpenInstance(
 
 	pOpen->OpenStatus = OpenClosed;
 	NdisReleaseSpinLock(&pOpen->OpenInUseLock);
+
+	// Remove all worker requests related to this instance.
+	NPF_PurgeRequests(pOpen->pFiltMod, NULL, NULL, pOpen);
 }
 
 
@@ -486,27 +544,19 @@ NPF_ReleaseOpenInstanceResources(
 
 	//
 	// free the buffer
-	// NOTE: the buffer is fragmented among the various CPUs, but the base pointer of the
-	// allocated chunk of memory is stored in the first slot (pOpen->CpuData[0])
 	//
 	if (pOpen->Size > 0)
 	{
-		ExFreePool(pOpen->CpuData[0].Buffer);
-		pOpen->CpuData[0].Buffer = NULL;
+		ExFreePool(pOpen->Buffer);
+		pOpen->Buffer = NULL;
 		pOpen->Size = 0;
 	}
 
-	//
-	// free the per CPU spinlocks
-	//
-	for (i = 0; i < g_NCpu; i++)
-	{
-		NdisFreeSpinLock(&pOpen->CpuData[i].BufferLock);
-	}
-
+	// Reminder for upgrade to NDIS 6.20: free this lock!
+	//NdisFreeRWLock(pOpen->BufferLock);
+	//NdisFreeRWLock(pOpen->MachineLock);
 	NdisFreeSpinLock(&pOpen->CountersLock);
 	NdisFreeSpinLock(&pOpen->WriteLock);
-	NdisFreeSpinLock(&pOpen->MachineLock);
 	NdisFreeSpinLock(&pOpen->OpenInUseLock);
 
 #ifdef NPCAP_KDUMP
@@ -534,6 +584,20 @@ NPF_ReleaseFilterModuleResources(
 
 	ASSERT(pFiltMod != NULL);
 	ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+	// Stop the writer thread
+	pFiltMod->WriterShouldStop = TRUE;
+	KeReleaseSemaphore(&pFiltMod->WriterSemaphore,
+			0,  // No priority boost
+			1,  // Increment semaphore by 1
+			TRUE );// WaitForXxx after this call
+	// Wait for the thread to terminate
+	KeWaitForSingleObject(pFiltMod->WriterThreadObj,
+			Executive,
+			KernelMode,
+			FALSE,
+			NULL );
+
+	ObDereferenceObject(pFiltMod->WriterThreadObj);
 
 	if (pFiltMod->PacketPool) // Release the packet buffer pool
 	{
@@ -551,7 +615,8 @@ NPF_ReleaseFilterModuleResources(
 	}
 
 	NdisFreeSpinLock(&pFiltMod->OIDLock);
-	NdisFreeSpinLock(&pFiltMod->OpenInstancesLock);
+	// Reminder for upgrade to NDIS 6.20: free this lock!
+	//NdisFreeRWLock(pFiltMod->OpenInstancesLock);
 	NdisFreeSpinLock(&pFiltMod->AdapterHandleLock);
 
 	TRACE_EXIT();
@@ -949,7 +1014,6 @@ NPF_Cleanup(
 	NDIS_STATUS Status;
 	PIO_STACK_LOCATION IrpSp;
 	LARGE_INTEGER ThreadDelay;
-	ULONG localNumOpenInstances;
 
 	TRACE_ENTER();
 
@@ -1069,7 +1133,14 @@ NPF_AddToGroupOpenArray(
 {
 	TRACE_ENTER();
 
-	NdisInterlockedPushEntryList(&(pFiltMod->OpenInstances), &(pOpen->OpenInstancesEntry), &pFiltMod->OpenInstancesLock);
+	LOCK_STATE lockState;
+
+	// Acquire lock for writing (modify list)
+	NdisAcquireReadWriteLock(&pFiltMod->OpenInstancesLock, TRUE, &lockState);
+
+	PushEntryList(&pFiltMod->OpenInstances, &pOpen->OpenInstancesEntry);
+
+	NdisReleaseReadWriteLock(&pFiltMod->OpenInstancesLock, &lockState);
 
 	TRACE_EXIT();
 }
@@ -1121,6 +1192,7 @@ NPF_RemoveFromGroupOpenArray(
 	ULONG BytesProcessed;
 	PVOID pBuffer = NULL;
 	BOOL found = FALSE;
+	LOCK_STATE lockState;
 
 	TRACE_ENTER();
 
@@ -1132,7 +1204,8 @@ NPF_RemoveFromGroupOpenArray(
 		return;
 	}
 
-	NdisAcquireSpinLock(&pFiltMod->OpenInstancesLock);
+	// Acquire lock for writing (modify list)
+	NdisAcquireReadWriteLock(&pFiltMod->OpenInstancesLock, TRUE, &lockState);
 
 	/* Store the previous combined packet filter */
 	OldPacketFilter = pFiltMod->MyPacketFilter;
@@ -1168,7 +1241,7 @@ NPF_RemoveFromGroupOpenArray(
 		Curr = Prev->Next;
 	}
 
-	NdisReleaseSpinLock(&pFiltMod->OpenInstancesLock);
+	NdisReleaseReadWriteLock(&pFiltMod->OpenInstancesLock, &lockState);
 
 	/* If the packet filter has changed, originate an OID Request to set it to the new value */
 	if (pFiltMod->MyPacketFilter != OldPacketFilter)
@@ -1424,6 +1497,12 @@ NPF_CreateOpenObject()
 
 	RtlZeroMemory(Open, sizeof(OPEN_INSTANCE));
 
+	/* Buffer */
+	NdisInitializeReadWriteLock(&Open->BufferLock);
+	Open->Accepted = 0;
+	Open->Received = 0;
+	Open->Dropped = 0;
+
 	Open->OpenSignature = OPEN_SIGNATURE;
 	Open->OpenStatus = OpenClosed;
 
@@ -1432,14 +1511,9 @@ NPF_CreateOpenObject()
 #ifdef NPCAP_KDUMP
 	NdisInitializeEvent(&Open->DumpEvent);
 #endif
-	NdisAllocateSpinLock(&Open->MachineLock);
+	NdisInitializeReadWriteLock(&Open->MachineLock);
 	NdisAllocateSpinLock(&Open->WriteLock);
 	Open->WriteInProgress = FALSE;
-
-	for (i = 0; i < g_NCpu; i++)
-	{
-		NdisAllocateSpinLock(&Open->CpuData[i].BufferLock);
-	}
 
 	//
 	// Initialize the open instance
@@ -1459,8 +1533,6 @@ NPF_CreateOpenObject()
 	Open->DumpFileHandle = NULL;
 	Open->DumpLimitReached = FALSE;
 #endif
-	Open->WriterSN = 0;
-	Open->ReaderSN = 0;
 	Open->Size = 0;
 	Open->SkipSentPackets = FALSE;
 	Open->ReadEvent = NULL;
@@ -1543,13 +1615,20 @@ NPF_CreateFilterModule(
 		return NULL;
 	}
 
-	NdisAllocateSpinLock(&pFiltMod->OpenInstancesLock);
+	NdisInitializeReadWriteLock(&pFiltMod->OpenInstancesLock);
 	pFiltMod->FilterModulesEntry.Next = NULL;
 	pFiltMod->OpenInstances.Next = NULL;
 
-	//  Initialize the request list
+	//  Initialize the OID request list
 	KeInitializeSpinLock(&pFiltMod->RequestSpinLock);
 	InitializeListHead(&pFiltMod->RequestList);
+
+	//  Initialize the writer request list
+	KeInitializeSpinLock(&pFiltMod->WriterRequestLock);
+	InitializeListHead(&pFiltMod->WriterRequestList);
+	KeInitializeSemaphore(&pFiltMod->WriterSemaphore, 0, MAXLONG);
+	pFiltMod->WriterShouldStop = FALSE;
+	pFiltMod->WriterThreadObj = NULL;
 	
 	// Default; expect this will be overwritten in NPF_Restart,
 	// or for Loopback when creating the fake module.
@@ -1586,6 +1665,51 @@ NPF_CreateFilterModule(
 
 	TRACE_EXIT();
 	return pFiltMod;
+}
+
+//-------------------------------------------------------------------
+
+_Use_decl_annotations_
+NDIS_STATUS
+NPF_RegisterOptions(
+	NDIS_HANDLE  NdisFilterHandle,
+	NDIS_HANDLE  FilterDriverContext
+	)
+/*++
+
+Routine Description:
+
+	Register optional handlers with NDIS.  This sample does not happen to
+	have any optional handlers to register, so this routine does nothing
+	and could simply have been omitted.  However, for illustrative purposes,
+	it is presented here.
+
+Arguments:
+
+	NdisFilterHandle - pointer the driver handle received from
+							 NdisFRegisterFilterDriver
+
+	FilterDriverContext    - pointer to our context passed into
+							 NdisFRegisterFilterDriver
+
+Return Value:
+
+	NDIS_STATUS_SUCCESS
+
+--*/
+{
+	TRACE_ENTER();
+
+	ASSERT(FilterDriverContext == (NDIS_HANDLE)FilterDriverObject);
+	if (FilterDriverContext != (NDIS_HANDLE)FilterDriverObject)
+	{
+		IF_LOUD(DbgPrint("NPF_RegisterOptions: driver doesn't match error, FilterDriverContext = %p, FilterDriverObject = %p.\n", FilterDriverContext, FilterDriverObject);)
+		return NDIS_STATUS_INVALID_PARAMETER;
+	}
+
+	TRACE_EXIT();
+
+	return NDIS_STATUS_SUCCESS;
 }
 
 //-------------------------------------------------------------------
@@ -1644,6 +1768,7 @@ NPF_AttachAdapter(
 	NDIS_FILTER_ATTRIBUTES	FilterAttributes;
 	BOOLEAN					bFalse = FALSE;
 	BOOLEAN					bDot11;
+	HANDLE threadHandle;
 
 	TRACE_ENTER();
 
@@ -1775,6 +1900,25 @@ NPF_AttachAdapter(
 		}
 #endif
 
+		Status = PsCreateSystemThread(&threadHandle, THREAD_ALL_ACCESS,
+				NULL, NULL, NULL, NPF_WriterThread, pFiltMod);
+		if (Status != STATUS_SUCCESS)
+		{
+			returnStatus = Status;
+			IF_LOUD(DbgPrint("PsCreateSystemThread: error, Status=%x.\n", Status);)
+			break;
+		}
+
+		// Convert the Thread object handle into a pointer to the Thread object
+		// itself. Then close the handle.
+		ObReferenceObjectByHandle(threadHandle,
+			THREAD_ALL_ACCESS,
+			NULL,
+			KernelMode,
+			&pFiltMod->WriterThreadObj,
+			NULL);
+
+		ZwClose(threadHandle);
 		NdisZeroMemory(&FilterAttributes, sizeof(NDIS_FILTER_ATTRIBUTES));
 		FilterAttributes.Header.Revision = NDIS_FILTER_ATTRIBUTES_REVISION_1;
 		FilterAttributes.Header.Size = sizeof(NDIS_FILTER_ATTRIBUTES);
@@ -2290,6 +2434,51 @@ Arguments:
 
 _Use_decl_annotations_
 VOID
+NPF_Status(
+	NDIS_HANDLE             FilterModuleContext,
+	PNDIS_STATUS_INDICATION StatusIndication
+	)
+/*++
+
+Routine Description:
+
+	Status indication handler
+
+Arguments:
+
+	FilterModuleContext     - our filter context
+	StatusIndication        - the status being indicated
+
+NOTE: called at <= DISPATCH_LEVEL
+
+  FILTER driver may call NdisFIndicateStatus to generate a status indication to
+  all higher layer modules.
+
+--*/
+{
+	PNPCAP_FILTER_MODULE pFiltMod = (PNPCAP_FILTER_MODULE) FilterModuleContext;
+
+// 	TRACE_ENTER();
+// 	IF_LOUD(DbgPrint("NPF: Status Indication\n");)
+
+	IF_LOUD(DbgPrint("status %x\n", StatusIndication->StatusCode);)
+
+	//
+	// The filter may do processing on the status indication here, including
+	// intercepting and dropping it entirely.  However, the sample does nothing
+	// with status indications except pass them up to the higher layer.  It is
+	// more efficient to omit the FilterStatus handler entirely if it does
+	// nothing, but it is included in this sample for illustrative purposes.
+	//
+	NdisFIndicateStatus(pFiltMod->AdapterHandle, StatusIndication);
+
+/*	TRACE_EXIT();*/
+}
+
+//-------------------------------------------------------------------
+
+_Use_decl_annotations_
+VOID
 NPF_DevicePnPEventNotify(
 	NDIS_HANDLE             FilterModuleContext,
 	PNET_DEVICE_PNP_EVENT   NetDevicePnPEvent
@@ -2392,6 +2581,88 @@ NOTE: called at PASSIVE_LEVEL
 
 //-------------------------------------------------------------------
 
+/* This function is a last resort when we can't tell the WriterThread to free
+ * something, like if something it needs becomes invalid or we can't allocate a
+ * request object. Locks the whole request queue while it works.
+ *
+ * If any of pNBL, pRadiotapHeader, or pOpen is NULL, it is ignored.
+ * If all 3 are NULL, all requests are purged, but all FREE requests are honored.
+ * If any of them is a pointer to an actual object, it will be used as the criteria for matching.
+ *
+ */
+VOID
+NPF_PurgeRequests(
+		PNPCAP_FILTER_MODULE pFiltMod,
+		PNET_BUFFER_LIST pNBL,
+		PUCHAR pRadiotapHeader,
+		POPEN_INSTANCE pOpen
+		)
+{
+	KIRQL OldIrql;
+	PLIST_ENTRY Curr = NULL;
+	PLIST_ENTRY Prev = NULL;
+	PNPF_WRITER_REQUEST pReq = NULL;
+
+	BOOLEAN bPurgeAll = !(pNBL || pRadiotapHeader || pOpen);
+
+	KeAcquireSpinLock(&pFiltMod->WriterRequestLock, &OldIrql);
+	Prev = &pFiltMod->WriterRequestList;
+	Curr = Prev->Flink;
+	while (Curr && Curr != &pFiltMod->WriterRequestList)
+	{
+		pReq = CONTAINING_RECORD(Curr, NPF_WRITER_REQUEST, WriterRequestEntry);
+		if ( bPurgeAll
+			|| (pNBL && pReq->pNBL == pNBL)
+			|| (pRadiotapHeader && pReq->pRadiotapHeader == pRadiotapHeader)
+			|| (pOpen && pReq->pOpen == pOpen)
+		   )
+		{
+			// Unlink and free
+			Prev->Flink = Curr->Flink;
+			Curr->Flink->Blink = Prev;
+			
+			switch (pReq->FunctionCode)
+			{
+				case NPF_WRITER_FREE_RADIOTAP:
+					NdisFreeMemory(pReq->pRadiotapHeader, SIZEOF_RADIOTAP_BUFFER, 0);
+					break;
+				case NPF_WRITER_FREE_NBL:
+					NdisFreeCloneNetBufferList(pReq->pNBL, 0);
+					break;
+				case NPF_WRITER_WRITE:
+					// If this was a packet to be written,
+					// count it as a drop
+					InterlockedIncrement(&pReq->pOpen->Dropped);
+					break;
+				default:
+					break;
+			}
+			NdisFreeMemory(pReq, sizeof(NPF_WRITER_REQUEST), 0);
+			Curr = Prev;
+		}
+		else
+		{
+			Prev = Curr;
+		}
+		Curr = Curr->Flink;
+	}
+	KeReleaseSpinLock(&pFiltMod->WriterRequestLock, OldIrql);
+}
+
+VOID NPF_QueueRequest(PNPCAP_FILTER_MODULE pFiltMod,
+	       	PNPF_WRITER_REQUEST pReq)
+{
+	// Enqueue the request
+	ExInterlockedInsertTailList(&pFiltMod->WriterRequestList,
+			&pReq->WriterRequestEntry,
+			&pFiltMod->WriterRequestLock);
+	// Wake the worker to deal with it.
+	KeReleaseSemaphore(&pFiltMod->WriterSemaphore,
+			0, // No priority boost
+			1, // Increment semaphore by 1
+			FALSE); // No WaitForXxx after this call
+}
+
 _Use_decl_annotations_
 VOID
 NPF_ReturnEx(
@@ -2423,16 +2694,35 @@ Arguments:
 --*/
 {
 	PNPCAP_FILTER_MODULE pFiltMod = (PNPCAP_FILTER_MODULE) FilterModuleContext;
-	PNET_BUFFER_LIST    CurrNbl = NetBufferLists;
-	UINT                NumOfNetBufferLists = 0;
-	BOOLEAN             DispatchLevel;
-	ULONG               Ref;
+	PNPF_WRITER_REQUEST pReq = NULL;
+	KIRQL OldIrql;
 
 /*	TRACE_ENTER();*/
 
-	// Return the received NBLs.  If you removed any NBLs from the chain, make
-	// sure the chain isn't empty (i.e., NetBufferLists!=NULL).
-	NdisFReturnNetBufferLists(pFiltMod->AdapterHandle, NetBufferLists, ReturnFlags);
+	// If this is our own allocated NBL, tell the Writer thread to clean it up.
+	// Queue ensures this happens after we're done copying anything from it.
+	if (NetBufferLists->NdisPoolHandle == pFiltMod->PacketPool)
+	{
+		pReq = NdisAllocateMemoryWithTagPriority(pFiltMod->AdapterHandle, sizeof(NPF_WRITER_REQUEST), '0OWA', NormalPoolPriority);
+		if (pReq == NULL) {
+			// Oh fudge, we can't allocate a work request.
+			// Clean up our mess the expensive way (lost packets, locked buffer).
+			NPF_PurgeRequests(pFiltMod, NetBufferLists, NULL, NULL);
+			NdisFreeCloneNetBufferList(NetBufferLists, 0);
+		}
+		else
+		{
+			pReq->FunctionCode = NPF_WRITER_FREE_NBL;
+			pReq->pNBL = NetBufferLists;
+			NPF_QueueRequest(pFiltMod, pReq);
+		}
+	}
+	else // Not our NBL
+	{
+		// Return the received NBLs.  If you removed any NBLs from the chain, make
+		// sure the chain isn't empty (i.e., NetBufferLists!=NULL).
+		NdisFReturnNetBufferLists(pFiltMod->AdapterHandle, NetBufferLists, ReturnFlags);
+	}
 
 /*	TRACE_EXIT();*/
 }
@@ -2469,6 +2759,37 @@ Return Value:
 	PNPCAP_FILTER_MODULE pFiltMod = (PNPCAP_FILTER_MODULE) FilterModuleContext;
 
 	NdisFCancelSendNetBufferLists(pFiltMod->AdapterHandle, CancelId);
+}
+
+//-------------------------------------------------------------------
+
+_Use_decl_annotations_
+NDIS_STATUS
+NPF_SetModuleOptions(
+	NDIS_HANDLE             FilterModuleContext
+	)
+/*++
+
+Routine Description:
+
+	This function set the optional handlers for the filter
+
+Arguments:
+
+	FilterModuleContext: The FilterModuleContext given to NdisFSetAttributes
+
+Return Value:
+
+	NDIS_STATUS_SUCCESS
+	NDIS_STATUS_RESOURCES
+	NDIS_STATUS_FAILURE
+
+--*/
+{
+   NDIS_STATUS Status = NDIS_STATUS_SUCCESS;
+   UNREFERENCED_PARAMETER(FilterModuleContext);
+
+   return Status;
 }
 
 //-------------------------------------------------------------------
@@ -2586,6 +2907,7 @@ NPF_SetPacketFilter(
 	PSINGLE_LIST_ENTRY Prev = NULL;
 	PSINGLE_LIST_ENTRY Curr = NULL;
 	PNPCAP_FILTER_MODULE pFiltMod = pOpen->pFiltMod;
+	LOCK_STATE lockState;
 	
 	ASSERT(pFiltMod != NULL);
 
@@ -2595,7 +2917,8 @@ NPF_SetPacketFilter(
 		return NDIS_STATUS_SUCCESS;
 	}
 
-	NdisAcquireSpinLock(&pFiltMod->OpenInstancesLock);
+	// Not modifying list, read-lock
+	NdisAcquireReadWriteLock(&pFiltMod->OpenInstancesLock, FALSE, &lockState);
 	pOpen->MyPacketFilter = PacketFilter;
 	Prev = &(pFiltMod->OpenInstances);
 	Curr = Prev->Next;
@@ -2606,7 +2929,7 @@ NPF_SetPacketFilter(
 		Prev = Curr;
 		Curr = Prev->Next;
 	}
-	NdisReleaseSpinLock(&pFiltMod->OpenInstancesLock);
+	NdisReleaseReadWriteLock(&pFiltMod->OpenInstancesLock, &lockState);
 
 #ifdef HAVE_DOT11_SUPPORT
 	// Check if we should be setting the raw wifi filter
