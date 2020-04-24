@@ -320,6 +320,7 @@ typedef struct _NPCAP_FILTER_MODULE
 	UINT					Medium;			///< Type of physical medium the underlying NDIS driver uses. See the
 											///< documentation of NdisOpenAdapter in the MS DDK for details.
 	NDIS_HANDLE				PacketPool;		///< Pool of NDIS_PACKET structures used to transfer the packets from and to the NIC driver.
+	NDIS_HANDLE TapNBPool; // Pool of NET_BUFFERs to hold capture data temporarily.
 	KSPIN_LOCK				RequestSpinLock;///< SpinLock used to synchronize the OID requests.
 	LIST_ENTRY				RequestList;	///< List of pending OID requests.
 	INTERNAL_REQUEST		Requests[MAX_REQUESTS]; ///< Array of structures that wrap every single OID request.
@@ -413,29 +414,50 @@ typedef struct _OPEN_INSTANCE
 } 
 OPEN_INSTANCE, *POPEN_INSTANCE;
 
-#define NPF_WRITER_WRITE 1
-#define NPF_WRITER_FREE_NBL (1<<1)
-#define NPF_WRITER_FREE_RADIOTAP (1<<2)
+typedef enum
+{
+	NPF_WRITER_INVALID_CODE,
+	NPF_WRITER_WRITE,
+	NPF_WRITER_FREE_NB_COPIES,
+	NPF_WRITER_FREE_MEM,
+} NPF_WRITER_FUNCTION_CODE;
 
 /* Structure of a serialized request to the writer thread */
 typedef struct _NPF_WRITER_REQUEST
 {
 	LIST_ENTRY WriterRequestEntry;
-	UINT FunctionCode;
+	NPF_WRITER_FUNCTION_CODE FunctionCode;
 	POPEN_INSTANCE pOpen;
 	PNET_BUFFER_LIST pNBL;
 	PNET_BUFFER pNetBuffer;
 	struct bpf_hdr BpfHeader;
-	PUCHAR pRadiotapHeader;
+	PVOID pBuffer;
+	SINGLE_LIST_ENTRY NBCopiesHead;
 }
 NPF_WRITER_REQUEST, *PNPF_WRITER_REQUEST;
+
+// no idea really, but Nmap uses this snaplen.
+#define NPF_NBCOPY_INITIAL_DATA_SIZE 256
+
+typedef struct _NPF_NB_COPIES
+{
+	SINGLE_LIST_ENTRY CopiesEntry;
+	PNET_BUFFER pNetBuffer; // May be NULL, hence why we can't just use NET_BUFFER.Next
+} NPF_NB_COPIES, *PNPF_NB_COPIES;
 
 VOID NPF_QueueRequest(PNPCAP_FILTER_MODULE pFiltMod,
 	PNPF_WRITER_REQUEST pReq);
 
+VOID NPF_QueuedFree(
+	PNPCAP_FILTER_MODULE pFiltMod,
+	NPF_WRITER_FUNCTION_CODE FunctionCode,
+	PNET_BUFFER_LIST pNBL,
+	PVOID pItem,
+	ULONG ulSize
+	);
+
 VOID NPF_PurgeRequests(PNPCAP_FILTER_MODULE pFiltMod,
 	PNET_BUFFER_LIST pNBL,
-	PUCHAR pRadiotapHeader,
 	POPEN_INSTANCE pOpen);
 
 VOID NPF_FillBuffer(POPEN_INSTANCE pOpen,
@@ -1294,9 +1316,17 @@ NPF_CreateOpenObject();
 */
 PNPCAP_FILTER_MODULE
 NPF_CreateFilterModule(
+	NDIS_HANDLE NdisFilterHandle,
 	PNDIS_STRING AdapterName,
 	UINT SelectedIndex
 	);
+
+VOID
+NPF_WriterThread(_In_ PVOID Context);
+VOID
+NPF_ReleaseOpenInstanceResources(POPEN_INSTANCE pOpen);
+VOID
+NPF_ReleaseFilterModuleResources(PNPCAP_FILTER_MODULE pFiltMod);
 
 
 #ifdef NPCAP_KDUMP

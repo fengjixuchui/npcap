@@ -216,6 +216,7 @@ DriverEntry(
 	ExInitializeDriverRuntime(DrvRtPoolNxOptIn);
 	
 	UNICODE_STRING AdapterName;
+	HANDLE threadHandle;
 
 	NDIS_STRING strKeQuerySystemTimePrecise;
 
@@ -413,7 +414,7 @@ DriverEntry(
 		// Create the fake "filter module" for loopback capture
 		// This is a hack to let NPF_CreateFilterModule create "\Device\NPCAP\Loopback" just like it usually does with a GUID
 		NDIS_STRING LoopbackDeviceName = NDIS_STRING_CONST("\\Device\\Loopback");
-		PNPCAP_FILTER_MODULE pFiltMod = NPF_CreateFilterModule(&LoopbackDeviceName, NdisMediumLoopback);
+		PNPCAP_FILTER_MODULE pFiltMod = NPF_CreateFilterModule(NULL, &LoopbackDeviceName, NdisMediumLoopback);
 		if (pFiltMod == NULL)
 		{
 			NPF_WSKFreeSockets();
@@ -423,6 +424,28 @@ DriverEntry(
 		}
 		pFiltMod->Loopback = TRUE;
 		pFiltMod->MaxFrameSize = NPF_LOOPBACK_INTERFACR_MTU + ETHER_HDR_LEN;
+		Status = PsCreateSystemThread(&threadHandle, THREAD_ALL_ACCESS,
+				NULL, NULL, NULL, NPF_WriterThread, pFiltMod);
+		if (Status != STATUS_SUCCESS)
+		{
+			NPF_ReleaseFilterModuleResources(pFiltMod);
+			ExFreePool(pFiltMod);
+			NPF_WSKFreeSockets();
+			NPF_WSKCleanup();
+			TRACE_EXIT();
+			return Status;
+		}
+
+		// Convert the Thread object handle into a pointer to the Thread object
+		// itself. Then close the handle.
+		ObReferenceObjectByHandle(threadHandle,
+			THREAD_ALL_ACCESS,
+			NULL,
+			KernelMode,
+			&pFiltMod->WriterThreadObj,
+			NULL);
+
+		ZwClose(threadHandle);
 		// No need to mess with SendToRx/BlockRx, packet filters, NDIS filter characteristics, Dot11, etc.
 		NPF_AddToFilterModuleArray(pFiltMod);
 	}
