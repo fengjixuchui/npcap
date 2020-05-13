@@ -46,22 +46,124 @@
  * https://github.com/nmap/npcap/blob/master/LICENSE.                      *
  *                                                                         *
  ***************************************************************************/
-// WlanRecord.h
-//
+#include "ObjPool.h"
+#include <ndis.h>
 
-#include <vector>
-using namespace std;
+// TODO: Implement a way to shrink the pool occasionally?
 
-typedef std::basic_string<TCHAR> tstring;
+typedef struct _NPF_OBJ_SHELF
+{
+	LIST_ENTRY ShelfEntry;
+	UCHAR pBuffer[];
+} NPF_OBJ_SHELF, *PNPF_OBJ_SHELF;
 
-#ifdef UNICODE
-#define RPC_TSTR RPC_WSTR
-#else
-#define RPC_TSTR RPC_CSTR
-#endif
+typedef struct _NPF_OBJ_POOL
+{
+	LIST_ENTRY ShelfHead;
+	KSPIN_LOCK ShelfLock;
+	LIST_ENTRY ObjectsHead;
+	KSPIN_LOCK ObjectsLock;
+	NDIS_HANDLE NdisHandle;
+	ULONG ulObjectSize;
+	ULONG ulIncrement;
+} NPF_OBJ_POOL;
 
-tstring printArray(vector<tstring> nstr);
+#define NPF_OBJECT_POOL_TAG 'TPON'
 
-vector<tstring> getWlanAdapterGuids();
+#define NPF_OBJ_ELEM_ALLOC_SIZE(POOL) (sizeof(NPF_OBJ_POOL_ELEM) + (POOL)->ulObjectSize)
+#define NPF_OBJ_SHELF_ALLOC_SIZE(POOL) ( sizeof(NPF_OBJ_SHELF) + NPF_OBJ_ELEM_ALLOC_SIZE(POOL) * (POOL)->ulIncrement)
 
-BOOL writeWlanAdapterGuidsToRegistry();
+BOOLEAN NPF_ExtendObjectShelf(PNPF_OBJ_POOL pPool)
+{
+	PNPF_OBJ_SHELF pShelf = NULL;
+	PNPF_OBJ_POOL_ELEM pElem = NULL;
+	ULONG i;
+
+       	pShelf = (PNPF_OBJ_SHELF) NdisAllocateMemoryWithTagPriority(pPool->NdisHandle,
+			NPF_OBJ_SHELF_ALLOC_SIZE(pPool),
+		       	NPF_OBJECT_POOL_TAG,
+			NormalPoolPriority);
+	if (pShelf == NULL)
+	{
+		return FALSE;
+	}
+	RtlZeroMemory(pShelf, NPF_OBJ_SHELF_ALLOC_SIZE(pPool));
+
+	ExInterlockedInsertTailList(&pPool->ShelfHead, &pShelf->ShelfEntry, &pPool->ShelfLock);
+
+	// Buffer starts after the shelf itself
+	for (i=0; i < pPool->ulIncrement; i++)
+	{
+		pElem = (PNPF_OBJ_POOL_ELEM) (pShelf->pBuffer + i * NPF_OBJ_ELEM_ALLOC_SIZE(pPool));
+		ExInterlockedInsertTailList(&pPool->ObjectsHead, &pElem->ObjectsEntry, &pPool->ObjectsLock);
+	}
+
+	return TRUE;
+}
+
+PNPF_OBJ_POOL NPF_AllocateObjectPool(NDIS_HANDLE NdisHandle, ULONG ulObjectSize, ULONG ulIncrement)
+{
+	PNPF_OBJ_POOL pPool = NULL;
+	PNPF_OBJ_SHELF pShelf = NULL;
+
+	pPool = NdisAllocateMemoryWithTagPriority(NdisHandle,
+			sizeof(NPF_OBJ_POOL),
+		       	NPF_OBJECT_POOL_TAG,
+			NormalPoolPriority);
+	if (pPool == NULL)
+	{
+		return NULL;
+	}
+
+	InitializeListHead(&pPool->ShelfHead);
+	KeInitializeSpinLock(&pPool->ShelfLock);
+	InitializeListHead(&pPool->ObjectsHead);
+	KeInitializeSpinLock(&pPool->ObjectsLock);
+
+	pPool->NdisHandle = NdisHandle;
+	pPool->ulObjectSize = ulObjectSize;
+	pPool->ulIncrement = ulIncrement;
+
+	return pPool;
+}
+
+PNPF_OBJ_POOL_ELEM NPF_ObjectPoolGet(PNPF_OBJ_POOL pPool)
+{
+	PLIST_ENTRY pEntry = ExInterlockedRemoveHeadList(&pPool->ObjectsHead, &pPool->ObjectsLock);
+	if (pEntry == NULL)
+	{
+		if (!NPF_ExtendObjectShelf(pPool))
+		{
+			return NULL;
+		}
+		pEntry = ExInterlockedRemoveHeadList(&pPool->ObjectsHead, &pPool->ObjectsLock);
+	}
+
+	if (pEntry == NULL)
+	{
+		return NULL;
+	}
+
+	return CONTAINING_RECORD(pEntry, NPF_OBJ_POOL_ELEM, ObjectsEntry);
+}
+
+VOID NPF_FreeObjectPool(PNPF_OBJ_POOL pPool)
+{
+	PLIST_ENTRY pShelfEntry = NULL;
+
+	while ((pShelfEntry = ExInterlockedRemoveHeadList(&pPool->ShelfHead, &pPool->ShelfLock)) != NULL)
+	{
+		NdisFreeMemory(
+				CONTAINING_RECORD(pShelfEntry, NPF_OBJ_SHELF, ShelfEntry),
+				NPF_OBJ_SHELF_ALLOC_SIZE(pPool),
+				0);
+	}
+	NdisFreeMemory(pPool, sizeof(NPF_OBJ_POOL), 0);
+}
+
+VOID NPF_ObjectPoolReturn(PNPF_OBJ_POOL pPool, PNPF_OBJ_POOL_ELEM pElem)
+{
+	// Insert at the head instead of the tail, hoping the next Get will
+	// avoid a cache miss.
+	ExInterlockedInsertHeadList(&pPool->ObjectsHead, &pElem->ObjectsEntry, &pPool->ObjectsLock);
+}

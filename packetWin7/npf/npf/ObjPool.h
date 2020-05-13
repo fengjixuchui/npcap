@@ -46,36 +46,58 @@
  * https://github.com/nmap/npcap/blob/master/LICENSE.                      *
  *                                                                         *
  ***************************************************************************/
-/*++
+#include <ntddk.h>
+#include <ndis.h>
 
-Module Name:
+/* An object pool handles allocating objects in batches to save time/allocations.
+ * It is beneficial for objects which are allocated and freed frequently and
+ * have a limited lifetime.
+ */
+typedef struct _NPF_OBJ_POOL *PNPF_OBJ_POOL;
 
-RegUtil.h
+/* Objects in the pool are retrieved and returned using this struct.
+ * pObject is an uninitialized array of ulObjectSize bytes.
+ */
+typedef struct _NPF_OBJ_POOL_ELEM
+{
+	LIST_ENTRY ObjectsEntry;
+	UCHAR pObject[];
+} NPF_OBJ_POOL_ELEM, *PNPF_OBJ_POOL_ELEM;
 
-Abstract:
+/* Allocates an object pool.
+ * param NdisHandle An NDIS handle like that returned by NdisFRegisterFilterDriver.
+ * param ulObjectSize The size of object this pool will create
+ * param ulIncrement Objects are allocated in multiples of this parameter
+ */
+PNPF_OBJ_POOL NPF_AllocateObjectPool(NDIS_HANDLE NdisHandle, ULONG ulObjectSize, ULONG ulIncrement);
 
-This is used for operating on registry.
+/* Frees an object pool and all associated memory.
+ * All objects obtained from the pool are invalid.
+ * param pPool A pointer to the pool obtained via NPF_AllocateObjectPool
+ */
+VOID NPF_FreeObjectPool(PNPF_OBJ_POOL pPool);
 
---*/
+/* Retrieve an object from the pool. The object is uninitialized and pointed to
+ * by the pObject member of the returned element.
+ * param pPool A pointer to the pool obtained via NPF_AllocateObjectPool
+ */
+PNPF_OBJ_POOL_ELEM NPF_ObjectPoolGet(PNPF_OBJ_POOL pPool);
 
-#include <vector>
-using namespace std;
+/* Convenient macro to return just the typecast object from the pool
+ * param _P A pointer to the pool obtained via NPF_AllocateObjectPool
+ * param _T The type of the object obtained
+ */
+#define NPF_POOL_GET(_P, _T) ((_T) (NPF_ObjectPoolGet(_P))->pObject)
 
-#include "..\..\Common\WpcapNames.h"
+/* Return an object to the pool.
+ * param pPool A pointer to the pool obtained via NPF_AllocateObjectPool
+ * param pElem A pointer to a NPF_OBJ_POOL_ELEM containing the object to return 
+ */
+VOID NPF_ObjectPoolReturn(PNPF_OBJ_POOL pPool, PNPF_OBJ_POOL_ELEM pElem);
 
-#define		NPF_SOFT_REGISTRY_NAME_T			_T(NPF_SOFT_REGISTRY_NAME)
-#define		NPF_DRIVER_NAME_SMALL_T				_T(NPF_DRIVER_NAME_SMALL)
-#define		NPCAP_REG_KEY_NAME					_T("SOFTWARE\\") NPF_SOFT_REGISTRY_NAME_T
-#define		NPCAP_SERVICE_REG_KEY_NAME			_T("SYSTEM\\CurrentControlSet\\Services\\") NPF_DRIVER_NAME_SMALL_T
-#define		NPCAP_REG_LOOPBACK_VALUE_NAME		_T("LoopbackAdapter")
+/* Convenient macro to return directly from a pointer to the object.
+ * param _P A pointer to the pool obtained via NPF_AllocateObjectPool
+ * param _O A pointer to an object stored within a NPF_OBJ_POOL_ELEM
+ */
+#define NPF_POOL_RETURN(_P, _O) (NPF_ObjectPoolReturn(_P, CONTAINING_RECORD((_O), NPF_OBJ_POOL_ELEM, pObject)))
 
-typedef std::basic_string<TCHAR> tstring;
-
-BOOL WriteStrToRegistry(LPCTSTR strSubKey, LPCTSTR strValueName, LPCTSTR strDeviceName, DWORD dwSamDesired);
-BOOL DeleteValueFromRegistry(LPCTSTR strSubKey, LPCTSTR strValueName);
-BOOL IncrementRegistryDword(LPCTSTR strSubKey, LPCTSTR strValueName, DWORD maxValue);
-
-tstring printAdapterNames(vector<tstring> nstr);
-
-BOOL addNpcapFolderToPath();
-BOOL removeNpcapFolderFromPath();

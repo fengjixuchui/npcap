@@ -119,13 +119,13 @@ NPF_Write(
 		return STATUS_INVALID_HANDLE;
 	}
 
-	if (NPF_StartUsingOpenInstance(Open) == FALSE)
+	if (!NPF_StartUsingOpenInstance(Open, OpenRunning))
 	{
-		// 
-		// an IRP_MJ_CLEANUP was received, just fail the request
-		//
+		// Write requires an attached adapter.
 		Irp->IoStatus.Information = 0;
-		Irp->IoStatus.Status = STATUS_CANCELLED;
+		Irp->IoStatus.Status = (Open->OpenStatus == OpenDetached
+					? STATUS_DEVICE_REMOVED
+					: STATUS_CANCELLED);
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
 		TRACE_EXIT();
 		return STATUS_CANCELLED;
@@ -138,7 +138,7 @@ NPF_Write(
 	//
 	if (NumSends == 0)
 	{
-		NPF_StopUsingOpenInstance(Open);
+		NPF_StopUsingOpenInstance(Open, OpenRunning);
 		Irp->IoStatus.Information = 0;
 		Irp->IoStatus.Status = STATUS_SUCCESS;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -159,7 +159,7 @@ NPF_Write(
 	{
 		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "Write parameters empty. Send aborted");
 
-		NPF_StopUsingOpenInstance(Open);
+		NPF_StopUsingOpenInstance(Open, OpenRunning);
 
 		Irp->IoStatus.Information = 0;
 		Irp->IoStatus.Status = STATUS_UNSUCCESSFUL;
@@ -176,7 +176,7 @@ NPF_Write(
 	{
 		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "Adapter is probably unbinding, cannot send packets");
 
-		NPF_StopUsingOpenInstance(Open);
+		NPF_StopUsingOpenInstance(Open, OpenRunning);
 
 		Irp->IoStatus.Information = 0;
 		Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
@@ -192,7 +192,7 @@ NPF_Write(
 	{
 		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "Frame size out of range, or maxFrameSize = 0. Send aborted");
 
-		NPF_StopUsingOpenInstance(Open);
+		NPF_StopUsingOpenInstance(Open, OpenRunning);
 
 		Irp->IoStatus.Information = 0;
 		Irp->IoStatus.Status = STATUS_UNSUCCESSFUL;
@@ -211,7 +211,7 @@ NPF_Write(
 
 		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "Another Send operation is in progress, aborting.");
 
-		NPF_StopUsingOpenInstance(Open);
+		NPF_StopUsingOpenInstance(Open, OpenRunning);
 
 		Irp->IoStatus.Information = 0;
 		Irp->IoStatus.Status = STATUS_DEVICE_BUSY;
@@ -235,7 +235,7 @@ NPF_Write(
 		IrpSp->Parameters.Write.Length);
 
 	// WinPcap emulation: loop back injected packets if anyone's listening.
-	// Except when PACKET_DISABLE_LOOPBACK is chosen, then don't loop back.
+	// Except when NPF_DISABLE_LOOPBACK is chosen, then don't loop back.
 	if (!Open->SkipSentPackets)
 	{
 		SendFlags |= NDIS_SEND_FLAGS_CHECK_FOR_LOOPBACK;
@@ -411,7 +411,7 @@ NPF_Write_End:
 	Open->WriteInProgress = FALSE;
 	NdisReleaseSpinLock(&Open->WriteLock);
 
-	NPF_StopUsingOpenInstance(Open);
+	NPF_StopUsingOpenInstance(Open, OpenRunning);
 
 	//
 	// Complete the Irp and return success
@@ -489,7 +489,7 @@ NPF_BufferedWrite(
 	}
 
 	// WinPcap emulation: loop back injected packets if anyone's listening.
-	// Except when PACKET_DISABLE_LOOPBACK is chosen, then don't loop back.
+	// Except when NPF_DISABLE_LOOPBACK is chosen, then don't loop back.
 	if (!Open->SkipSentPackets)
 	{
 		SendFlags |= NDIS_SEND_FLAGS_CHECK_FOR_LOOPBACK;

@@ -104,8 +104,6 @@ typedef struct _NDIS_OID_REQUEST *FILTER_REQUEST_CONTEXT,**PFILTER_REQUEST_CONTE
 //
 extern NDIS_HANDLE         FilterDriverObject;
 
-#define  MAX_REQUESTS						128 ///< Maximum number of simultaneous IOCTL requests.
-
 #define Packet_ALIGNMENT sizeof(int) ///< Alignment macro. Defines the alignment size.
 #define Packet_WORDALIGN(x) (((x)+(Packet_ALIGNMENT-1))&~(Packet_ALIGNMENT-1))	///< Alignment macro. Rounds up to the next
 ///< even multiple of Packet_ALIGNMENT.
@@ -193,6 +191,8 @@ struct packet_file_header
 			+ 12 /* VHT */
 #endif
 
+#include "ObjPool.h"
+
 /*!
   \brief Header associated to a packet in the driver's buffer when the driver is in dump mode.
   Similar to the bpf_hdr structure, but simpler.
@@ -236,9 +236,6 @@ C_ASSERT(sizeof(PACKET_OID_DATA) == 12);
 */
 typedef struct _INTERNAL_REQUEST
 {
-	LIST_ENTRY			ListElement;		///< Used to handle lists of requests.
-	// PIRP				Irp;				///< Irp that performed the request
-	// BOOLEAN			Internal;			///< True if the request is for internal use of npf.sys. False if the request is performed by the user through an IOCTL.
 	NDIS_EVENT			InternalRequestCompletedEvent;
 	NDIS_OID_REQUEST	Request;			///< The structure with the actual request, that will be passed to NdisRequest().
 	NDIS_STATUS			RequestStatus;
@@ -253,6 +250,8 @@ typedef struct _DEVICE_EXTENSION
 {
 	PWSTR		ExportString;			///< Name of the exported device, i.e. name that the applications will use
 										///< to open this adapter through Packet.dll.
+	SINGLE_LIST_ENTRY DetachedOpens; //GroupHead
+	KSPIN_LOCK DetachedOpensLock; // GroupLock
 } DEVICE_EXTENSION, *PDEVICE_EXTENSION;
 
 typedef enum _FILTER_STATE
@@ -271,7 +270,7 @@ typedef enum _FILTER_STATE
 typedef enum _OPEN_STATE
 {
 	OpenRunning,
-	OpenClosing,
+	OpenDetached,
 	OpenClosed
 } OPEN_STATE;
 
@@ -291,6 +290,8 @@ typedef struct _NPCAP_FILTER_MODULE
 	KSEMAPHORE WriterSemaphore; // Semaphore to signal writer thread of new requests
 	BOOLEAN WriterShouldStop; // Flag to kill writer thread
 	PVOID WriterThreadObj; // Pointer to the writer thread itself.
+	PNPF_OBJ_POOL WriterRequestPool; // Pool of request objects
+	PNPF_OBJ_POOL NBCopiesPool; // Pool of NET_BUFFER copy objects
 
 	NDIS_STRING				AdapterName;
 #ifdef HAVE_WFP_LOOPBACK_SUPPORT
@@ -303,6 +304,7 @@ typedef struct _NPCAP_FILTER_MODULE
 #ifdef HAVE_DOT11_SUPPORT
 	BOOLEAN					HasDataRateMappingTable;
 	DOT11_DATA_RATE_MAPPING_TABLE	DataRateMappingTable;
+	PNPF_OBJ_POOL Dot11HeaderPool; // Pool of Radiotap header buffers
 #endif
 
 	ULONG					MyPacketFilter;
@@ -321,9 +323,7 @@ typedef struct _NPCAP_FILTER_MODULE
 											///< documentation of NdisOpenAdapter in the MS DDK for details.
 	NDIS_HANDLE				PacketPool;		///< Pool of NDIS_PACKET structures used to transfer the packets from and to the NIC driver.
 	NDIS_HANDLE TapNBPool; // Pool of NET_BUFFERs to hold capture data temporarily.
-	KSPIN_LOCK				RequestSpinLock;///< SpinLock used to synchronize the OID requests.
-	LIST_ENTRY				RequestList;	///< List of pending OID requests.
-	INTERNAL_REQUEST		Requests[MAX_REQUESTS]; ///< Array of structures that wrap every single OID request.
+	PNPF_OBJ_POOL InternalRequestPool; // Pool of INTERNAL_REQUEST structures that wrap every single OID request.
 	UINT					MaxFrameSize;	///< Maximum frame size that the underlying MAC acceptes. Used to perform a check on the
 											///< size of the frames sent with NPF_Write() or NPF_BufferedWrite().
 	ULONG					AdapterHandleUsageCounter;
@@ -342,6 +342,7 @@ typedef struct _OPEN_INSTANCE
     SINGLE_LIST_ENTRY OpenInstancesEntry; //GroupNext
     PNPCAP_FILTER_MODULE pFiltMod;
 
+	PDEVICE_EXTENSION DeviceExtension;
 	ULONG					MyPacketFilter;
 	PKEVENT					ReadEvent;		///< Pointer to the event on which the read calls on this instance must wait.
 	PUCHAR					bpfprogram;		///< Pointer to the filtering pseudo-code associated with current instance of the driver.
@@ -404,7 +405,7 @@ typedef struct _OPEN_INSTANCE
 	ULONG Size; ///< Size of the kernel buffer
 	NDIS_EVENT				NdisWriteCompleteEvent;	///< Event that is signalled when all the packets have been successfully sent by NdisSend (and corresponfing sendComplete has been called)
 	ULONG					TransmitPendingPackets;	///< Specifies the number of packets that are pending to be transmitted, i.e. have been submitted to NdisSendXXX but the SendComplete has not been called yet.
-	ULONG					NumPendingIrps;
+	ULONG PendingIrps[OpenClosed];
 
 	OPEN_STATE OpenStatus;
 	NDIS_SPIN_LOCK			OpenInUseLock;
@@ -419,6 +420,7 @@ typedef enum
 	NPF_WRITER_INVALID_CODE,
 	NPF_WRITER_WRITE,
 	NPF_WRITER_FREE_NB_COPIES,
+	NPF_WRITER_FREE_RADIOTAP,
 	NPF_WRITER_FREE_MEM,
 } NPF_WRITER_FUNCTION_CODE;
 
@@ -1401,9 +1403,9 @@ VOID NPF_StopUsingBinding(IN PNPCAP_FILTER_MODULE pFiltMod);
 
 VOID NPF_CloseBinding(IN PNPCAP_FILTER_MODULE pFiltMod);
 
-BOOLEAN NPF_StartUsingOpenInstance(IN POPEN_INSTANCE pOpen);
+BOOLEAN NPF_StartUsingOpenInstance(IN POPEN_INSTANCE pOpen, OPEN_STATE MaxOpen);
 
-VOID NPF_StopUsingOpenInstance(IN POPEN_INSTANCE pOpen);
+VOID NPF_StopUsingOpenInstance(IN POPEN_INSTANCE pOpen, OPEN_STATE MaxOpen);
 
 VOID NPF_CloseOpenInstance(IN POPEN_INSTANCE pOpen);
 
@@ -1426,8 +1428,6 @@ NTSTATUS NPF_GetCurrentFrequency(IN PNPCAP_FILTER_MODULE pFiltMod, OUT PULONG pC
 
 ULONG NPF_GetCurrentFrequency_Wrapper(IN PNPCAP_FILTER_MODULE pFiltMod);
 #endif
-
-VOID NPF_ResetBufferContents(POPEN_INSTANCE Open);
 
 /**
  *  @}
