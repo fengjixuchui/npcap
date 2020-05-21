@@ -4,7 +4,7 @@ Npcap
 [![Build status](https://ci.appveyor.com/api/projects/status/01yoks5rn14wgny2?svg=true)](https://ci.appveyor.com/project/hsluoyz/npcap)
 ![Environment](https://img.shields.io/badge/Windows-7,%208,%208.1,%2010-brightgreen.svg)
 [![Release](https://img.shields.io/github/release/nmap/npcap.svg)](https://npcap.org/#download)
-[![Issues](https://img.shields.io/github/issues/nmap/nmap/npcap.svg)](https://github.com/nmap/nmap/issues?q=is%3Aopen+is%3Aissue+label%3Anpcap+label%3ANpcap)
+[![Issues](https://img.shields.io/github/issues/nmap/npcap.svg)](https://github.com/nmap/npcap/issues)
 
 [**Npcap**](https://npcap.org) is a packet capture and injection library for
 Windows by the [**Nmap Project**](https://nmap.org). It is a complete update to
@@ -30,8 +30,8 @@ can be downloaded from https://npcap.org/#download
 
 ## Bug report
 
-Please report any bugs or issues about Npcap at: [Nmap issues on
-GitHub](https://github.com/nmap/nmap/issues). In your report, please provide
+Please report any bugs or issues about Npcap at: [Npcap issues on
+GitHub](https://github.com/nmap/npcap/issues). In your report, please provide
 your
 [**DiagReport**](https://npcap.org/guide/npcap-users-guide.html#npcap-issues-diagreport)
 output, user software version (e.g. Nmap, Wireshark), reproduce steps and other
@@ -56,4 +56,4 @@ installer and commercial support as well as special license rights.
 
 * ``dev@nmap.org`` (Nmap development list, for technical issues and discussion)
 * ``sales@nmap.com`` (Sales address for commercial/licensing issues)
-* [Npcap Issues Tracker](https://github.com/nmap/nmap/issues/) (Bugs can be filed on this shared Nmap/Npcap tracker)
+* [Npcap Issues Tracker](https://github.com/nmap/npcap/issues/)
