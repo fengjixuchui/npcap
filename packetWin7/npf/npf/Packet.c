@@ -371,6 +371,7 @@ DriverEntry(
 	}
 
 	PDEVICE_EXTENSION devExtP = (PDEVICE_EXTENSION)devObjP->DeviceExtension;
+	devExtP->pDevObj = devObjP;
 
 	devObjP->Flags |= DO_DIRECT_IO;
 
@@ -395,6 +396,7 @@ DriverEntry(
 
 #ifdef HAVE_WFP_LOOPBACK_SUPPORT
 	if (g_LoopbackSupportMode) {
+#ifndef NPCAP_READ_ONLY
 		// Use Winsock Kernel (WSK) to send loopback packets.
 		// TODO: Allow this to continue but disable loopback if there's an error
 		Status = NPF_WSKStartup();
@@ -411,6 +413,7 @@ DriverEntry(
 			TRACE_EXIT();
 			return Status;
 		}
+#endif
 
 		// Create the fake "filter module" for loopback capture
 		// This is a hack to let NPF_CreateFilterModule create "\Device\NPCAP\Loopback" just like it usually does with a GUID
@@ -418,8 +421,10 @@ DriverEntry(
 		PNPCAP_FILTER_MODULE pFiltMod = NPF_CreateFilterModule(NULL, &LoopbackDeviceName, NdisMediumLoopback);
 		if (pFiltMod == NULL)
 		{
+#ifndef NPCAP_READ_ONLY
 			NPF_WSKFreeSockets();
 			NPF_WSKCleanup();
+#endif
 			TRACE_EXIT();
 			return NDIS_STATUS_RESOURCES;
 		}
@@ -431,8 +436,10 @@ DriverEntry(
 		{
 			NPF_ReleaseFilterModuleResources(pFiltMod);
 			ExFreePool(pFiltMod);
+#ifndef NPCAP_READ_ONLY
 			NPF_WSKFreeSockets();
 			NPF_WSKCleanup();
+#endif
 			TRACE_EXIT();
 			return Status;
 		}
@@ -463,8 +470,10 @@ DriverEntry(
 	if (Status != NDIS_STATUS_SUCCESS)
 	{
 #ifdef HAVE_WFP_LOOPBACK_SUPPORT
+#ifndef NPCAP_READ_ONLY
 		NPF_WSKFreeSockets();
 		NPF_WSKCleanup();
+#endif
 #endif
 		NdisFreeSpinLock(&g_FilterArrayLock);
 		TRACE_MESSAGE1(PACKET_DEBUG_LOUD, "NdisFRegisterFilterDriver: failed to register filter with NDIS, Status = %x", Status);
@@ -795,9 +804,11 @@ Return Value:
 		g_LoopbackAdapterName.Buffer = NULL;
 	}
 
+#ifndef NPCAP_READ_ONLY
 	// Release WSK resources.
 	NPF_WSKFreeSockets();
 	NPF_WSKCleanup();
+#endif
 
 	// Release WFP resources
 	NPF_UnregisterCallouts();
@@ -904,7 +915,11 @@ Return Value:
 	// NdisFreeString(g_NPF_Prefix);
 }
 
-VOID NPF_ResetBufferContents(POPEN_INSTANCE Open, BOOLEAN AcquireLock);
+VOID
+NPF_ResetBufferContents(
+	IN POPEN_INSTANCE Open,
+	IN BOOLEAN AcquireLock
+);
 
 #define SET_RESULT_SUCCESS(__a__) do{\
 	Information = __a__;	\
@@ -996,11 +1011,17 @@ NPF_IoControl(
 
 	switch (FunctionCode)
 	{
+		// BIOCSETBUFFERSIZE and BIOCSMODE do not technically require
+		// an attached adapter, but NPF_StartUsingOpenInstance(x, OpenRunning)
+		// does some initialization that is needed to start actually
+		// processing packets
+		case BIOCSETBUFFERSIZE:
+		case BIOCSMODE:
+		// These functions require an attached adapter
 		case BIOCSENDPACKETSSYNC:
 		case BIOCSENDPACKETSNOSYNC:
 		case BIOCSETOID:
 		case BIOCQUERYOID:
-			// These functions requires an attached adapter
 			MaxState = OpenRunning;
 			break;
 		default:
