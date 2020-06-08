@@ -354,8 +354,7 @@ NPF_TapLoopback(
 			while (pNetBuffer)
 			{
 				Offset = NET_BUFFER_CURRENT_MDL_OFFSET(pNetBuffer);
-				if (Offset) {
-					/* Need to eliminate empty data prior to offset in our fake copy. */
+				if (Offset >= numBytes) {
 					NdisQueryMdl(NET_BUFFER_CURRENT_MDL(pNetBuffer),
 							&pOrigBuf,
 							&OrigLen,
@@ -364,44 +363,67 @@ NPF_TapLoopback(
 						TRACE_MESSAGE(PACKET_DEBUG_LOUD, "NPF_TapLoopback: Failed to query MDL");
 						break;
 					}
-					/* Make a buffer big enough for our fake DLT header plus used
-					 * data of first MDL */
-					FirstMDLLen = numBytes + OrigLen - Offset;
-					pTmpBuf = NdisAllocateMemoryWithTagPriority(
-							pLoopbackFilter->AdapterHandle, FirstMDLLen, NPF_TAG_LOOPBACK_COPY, NormalPoolPriority);
-					if (pTmpBuf == NULL)
-					{
-						TRACE_MESSAGE(PACKET_DEBUG_LOUD,
-								"NPF_TapLoopback: Failed to allocate buffer.");
-						break;
-					}
-					RtlCopyMemory(pTmpBuf, pPacketData, numBytes);
-					RtlCopyMemory(pTmpBuf + numBytes, pOrigBuf + Offset, OrigLen - Offset);
-					pMdl = NdisAllocateMdl(pLoopbackFilter->AdapterHandle, pTmpBuf, FirstMDLLen);
-					if (pMdl == NULL) {
-						TRACE_MESSAGE(PACKET_DEBUG_LOUD,
-								"NPF_TapLoopback: Failed to allocate MDL.");
-						break;
-					}
-					pMdl->Next = NET_BUFFER_CURRENT_MDL(pNetBuffer)->Next;
+					RtlCopyMemory(pOrigBuf + Offset - numBytes, pPacketData, numBytes);
+					NET_BUFFER_FIRST_MDL(pFakeNetBuffer) =
+					       	NET_BUFFER_CURRENT_MDL(pFakeNetBuffer) = NET_BUFFER_CURRENT_MDL(pNetBuffer);
+					NET_BUFFER_DATA_OFFSET(pFakeNetBuffer) = 
+						NET_BUFFER_CURRENT_MDL_OFFSET(pFakeNetBuffer) = Offset - numBytes;
+					NET_BUFFER_DATA_LENGTH(pFakeNetBuffer) = numBytes + NET_BUFFER_DATA_LENGTH(pNetBuffer);
+					// We didn't allocate a MDL, so make sure we don't free it.
+					(PMDL)(NET_BUFFER_PROTOCOL_RESERVED(pFakeNetBuffer)[0]) = NULL;
 				}
 				else {
-					/* No offset, so just make a plain MDL and chain to theirs */
-					pMdl = NdisAllocateMdl(pLoopbackFilter->AdapterHandle, npBuff, numBytes);
-					if (pMdl == NULL)
-					{
-						TRACE_MESSAGE(PACKET_DEBUG_LOUD,
-								"NPF_TapLoopback: Failed to allocate MDL.");
-						break;
+					if (Offset > 0) {
+						/* Need to eliminate empty data prior to offset in our fake copy. */
+						NdisQueryMdl(NET_BUFFER_CURRENT_MDL(pNetBuffer),
+								&pOrigBuf,
+								&OrigLen,
+								NormalPagePriority);
+						if (pOrigBuf == NULL) {
+							TRACE_MESSAGE(PACKET_DEBUG_LOUD, "NPF_TapLoopback: Failed to query MDL");
+							break;
+						}
+						/* Make a buffer big enough for our fake DLT header plus used
+						 * data of first MDL */
+						FirstMDLLen = numBytes + OrigLen - Offset;
+						pTmpBuf = NdisAllocateMemoryWithTagPriority(
+								pLoopbackFilter->AdapterHandle, FirstMDLLen, NPF_TAG_LOOPBACK_COPY, NormalPoolPriority);
+						if (pTmpBuf == NULL)
+						{
+							TRACE_MESSAGE(PACKET_DEBUG_LOUD,
+									"NPF_TapLoopback: Failed to allocate buffer.");
+							break;
+						}
+						RtlCopyMemory(pTmpBuf, pPacketData, numBytes);
+						RtlCopyMemory(pTmpBuf + numBytes, pOrigBuf + Offset, OrigLen - Offset);
+						pMdl = NdisAllocateMdl(pLoopbackFilter->AdapterHandle, pTmpBuf, FirstMDLLen);
+						if (pMdl == NULL) {
+							TRACE_MESSAGE(PACKET_DEBUG_LOUD,
+									"NPF_TapLoopback: Failed to allocate MDL.");
+							break;
+						}
+						pMdl->Next = NET_BUFFER_CURRENT_MDL(pNetBuffer)->Next;
 					}
-					FirstMDLLen = numBytes;
-					pMdl->Next = NET_BUFFER_CURRENT_MDL(pNetBuffer);
+					else {
+						/* Allocate a MDL for the remainder and chain to theirs */
+						pMdl = NdisAllocateMdl(pLoopbackFilter->AdapterHandle, npBuff, numBytes);
+						if (pMdl == NULL)
+						{
+							TRACE_MESSAGE(PACKET_DEBUG_LOUD,
+									"NPF_TapLoopback: Failed to allocate MDL.");
+							break;
+						}
+						FirstMDLLen = numBytes;
+						pMdl->Next = NET_BUFFER_CURRENT_MDL(pNetBuffer);
+					}
+					NET_BUFFER_FIRST_MDL(pFakeNetBuffer) = pMdl;
+					NET_BUFFER_DATA_LENGTH(pFakeNetBuffer) = numBytes + NET_BUFFER_DATA_LENGTH(pNetBuffer);
+					NET_BUFFER_DATA_OFFSET(pFakeNetBuffer) = 0;
+					NET_BUFFER_CURRENT_MDL(pFakeNetBuffer) = pMdl;
+					NET_BUFFER_CURRENT_MDL_OFFSET(pFakeNetBuffer) = 0;
+					// We use the ProtocolReserved field to indicate that the MDL needs to be freed.
+					(PMDL)(NET_BUFFER_PROTOCOL_RESERVED(pFakeNetBuffer)[0]) = pMdl;
 				}
-				NET_BUFFER_FIRST_MDL(pFakeNetBuffer) = pMdl;
-				NET_BUFFER_DATA_LENGTH(pFakeNetBuffer) = FirstMDLLen + NET_BUFFER_DATA_LENGTH(pNetBuffer);
-				NET_BUFFER_DATA_OFFSET(pFakeNetBuffer) = 0;
-				NET_BUFFER_CURRENT_MDL(pFakeNetBuffer) = pMdl;
-				NET_BUFFER_CURRENT_MDL_OFFSET(pFakeNetBuffer) = 0;
 				/* Move down the chain! */
 				pNetBuffer = pNetBuffer->Next;
 				if (pNetBuffer) {
@@ -419,7 +441,7 @@ NPF_TapLoopback(
 
 
 			// TODO: handle SkipSentPackets?
-			NPF_DoTap(pLoopbackFilter, pFakeNbl, NULL);
+			NPF_DoTap(pLoopbackFilter, pFakeNbl, NULL, FALSE);
 		} while (0);
 
 		if (pFakeNbl != NULL) {
@@ -427,12 +449,9 @@ NPF_TapLoopback(
 			pFakeNetBuffer = NET_BUFFER_LIST_FIRST_NB(pFakeNbl);
 			while (pFakeNetBuffer != NULL)
 			{
-				/* The first MDL in every fake NB is one we allocated, so we
-				 * need to free it and its associated buffer. */
-				pMdl = NET_BUFFER_CURRENT_MDL(pFakeNetBuffer);
+				// If this field is not NULL, it points to the MDL we need to free
+				pMdl = (PMDL)(NET_BUFFER_PROTOCOL_RESERVED(pFakeNetBuffer)[0]);
 
-				/* NULL check, since we could have bailed in the middle
-				 * due to allocation failure. */
 				if (pMdl != NULL) {
 					/* If the MDL's buffer is numBytes long, it's npBuff and we'll free it later.
 					 * Otherwise it's unique and we should free it now. */
@@ -746,7 +765,7 @@ NPF_NetworkClassifyInbound(
 
 
 				// TODO: handle SkipSentPackets?
-				NPF_DoTap(pLoopbackFilter, pClonedNetBufferList, NULL);
+				NPF_DoTap(pLoopbackFilter, pClonedNetBufferList, NULL, FALSE);
 			} while (0);
 			NPF_StopUsingBinding(pLoopbackFilter);
 		}
@@ -1055,6 +1074,7 @@ Exit:
 	return status;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 NPF_RegisterCallouts(
 _Inout_ void* deviceObject
@@ -1070,40 +1090,33 @@ Callouts and filters will be removed during DriverUnload.
 -- */
 {
 	TRACE_ENTER();
-	NTSTATUS status = STATUS_SUCCESS;
+	DWORD status = ERROR_SUCCESS;
 	FWPM_SUBLAYER NPFSubLayer;
 
 	BOOLEAN engineOpened = FALSE;
 	BOOLEAN inTransaction = FALSE;
 
 	FWPM_SESSION session = { 0 };
-	HANDLE hEngineHandle = NULL;
 
 	session.flags = FWPM_SESSION_FLAG_DYNAMIC;
-	session.sessionKey = NPF_FWPM_SESSION_GUID;
 
 	status = FwpmEngineOpen(
 		NULL,
 		RPC_C_AUTHN_WINNT,
 		NULL,
 		&session,
-		&hEngineHandle
+		&g_WFPEngineHandle
 		);
-	if (status == FWP_E_ALREADY_EXISTS) {
-		// Exit with success
-		status = ERROR_SUCCESS;
-		goto Exit;
-	}
-	g_WFPEngineHandle = hEngineHandle;
 
-	if (!NT_SUCCESS(status) || !g_WFPEngineHandle || g_WFPEngineHandle == INVALID_HANDLE_VALUE)
+	if (status != NO_ERROR || !g_WFPEngineHandle || g_WFPEngineHandle == INVALID_HANDLE_VALUE)
 	{
+		g_WFPEngineHandle = INVALID_HANDLE_VALUE;
 		goto Exit;
 	}
 	engineOpened = TRUE;
 
 	status = FwpmTransactionBegin(g_WFPEngineHandle, 0);
-	if (!NT_SUCCESS(status))
+	if (status != NO_ERROR)
 	{
 		goto Exit;
 	}
@@ -1121,7 +1134,7 @@ Callouts and filters will be removed during DriverUnload.
 	// implementation.
 
 	status = FwpmSubLayerAdd(g_WFPEngineHandle, &NPFSubLayer, NULL);
-	if (!NT_SUCCESS(status))
+	if (status != NO_ERROR)
 	{
 		goto Exit;
 	}
@@ -1207,6 +1220,8 @@ Exit:
 	return status;
 }
 
+
+_Use_decl_annotations_
 void
 NPF_UnregisterCallouts(
 	)
@@ -1239,6 +1254,7 @@ NPF_UnregisterCallouts(
 	TRACE_EXIT();
 }
 
+_Use_decl_annotations_
 NTSTATUS
 NPF_InitInjectionHandles(
 )
@@ -1286,6 +1302,7 @@ injection handles will be removed during DriverUnload.
 	return status;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 NPF_FreeInjectionHandles(
 	)

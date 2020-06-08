@@ -252,12 +252,6 @@ NPF_Write(
 
 	while (numSentPackets < NumSends)
 	{
-		if (!NPF_StartUsingBinding(Open->pFiltMod)) {
-			// The adapter is pending to pause, so we don't send the packets.
-			TRACE_MESSAGE(PACKET_DEBUG_LOUD, "The adapter is pending to pause, unable to send the packets.");
-			Status = STATUS_DEVICE_DOES_NOT_EXIST;
-			goto NPF_Write_End;
-		}
 		/* Unlike NPF_BufferedWrite, we can directly allocate NBLs
 		 * using the MDL in the IRP because the device was created with
 		 * DO_DIRECT_IO. */
@@ -292,7 +286,7 @@ NPF_Write(
 			if (Open->pFiltMod->Loopback == FALSE)
 			{
 #endif
-				NPF_DoTap(Open->pFiltMod, pNetBufferList, Open);
+				NPF_DoTap(Open->pFiltMod, pNetBufferList, Open, FALSE);
 #ifdef HAVE_WFP_LOOPBACK_SUPPORT
 			}
 #endif
@@ -384,7 +378,6 @@ NPF_Write(
 			//
 			NdisWaitEvent(&Open->WriteEvent, 1);
 		}
-		NPF_StopUsingBinding(Open->pFiltMod);
 	}
 
 	//
@@ -401,8 +394,6 @@ NPF_Write(
 	else
 #endif
 		NdisWaitEvent(&Open->NdisWriteCompleteEvent, 0);
-
-NPF_Write_End:
 
 	//
 	// no more writes are in progress
@@ -572,12 +563,6 @@ NPF_BufferedWrite(
 		}
 		RtlCopyMemory(npBuff, UserBuff + Pos, pWinpcapHdr->caplen);
 
-		if (!NPF_StartUsingBinding(Open->pFiltMod)) {
-			// The adapter is pending to pause, so we don't send the packets.
-			TRACE_MESSAGE(PACKET_DEBUG_LOUD, "The adapter is pending to pause, unable to send the packets.");
-			result = -STATUS_DEVICE_DOES_NOT_EXIST;
-			break;
-		}
 		// Allocate an MDL to map the packet data
 		TmpMdl = NdisAllocateMdl(Open->pFiltMod, npBuff, pWinpcapHdr->caplen);
 
@@ -586,7 +571,6 @@ NPF_BufferedWrite(
 			// Unable to map the memory: packet lost
 			IF_LOUD(DbgPrint("NPF_BufferedWrite: unable to allocate the MDL.\n");)
 
-			NPF_StopUsingBinding(Open->pFiltMod);
 			result = -STATUS_INSUFFICIENT_RESOURCES;
 			break;
 		}
@@ -627,7 +611,6 @@ NPF_BufferedWrite(
 				// Second failure, report an error
 				NdisFreeMdl(TmpMdl);
 
-				NPF_StopUsingBinding(Open->pFiltMod);
 				result = -STATUS_INSUFFICIENT_RESOURCES;
 				break;
 			}
@@ -645,7 +628,7 @@ NPF_BufferedWrite(
 
 		//receive the packets before sending them
 		// TODO: Should we check for loopback like we do in NPF_Write?
-		NPF_DoTap(Open->pFiltMod, pNetBufferList, Open);
+		NPF_DoTap(Open->pFiltMod, pNetBufferList, Open, FALSE);
 
 		pNetBufferList->SourceHandle = Open->pFiltMod->AdapterHandle;
 		RESERVED(pNetBufferList)->ChildOpen = Open; //save the child open object in the packets
@@ -681,11 +664,6 @@ NPF_BufferedWrite(
 					NDIS_DEFAULT_PORT_NUMBER,
 					SendFlags);
 			}
-
-		// 
-		// release ownership of the NdisAdapter binding
-		//
-		NPF_StopUsingBinding(Open->pFiltMod);
 
 		// We've sent the packet, so leave it up to SendComplete to free the buffer
 		npBuff = NULL;
@@ -878,7 +856,7 @@ Return Value:
 	POPEN_INSTANCE		ChildOpen;
 	PSINGLE_LIST_ENTRY Curr;
 	POPEN_INSTANCE		TempOpen;
-	LOCK_STATE lockState;
+	LOCK_STATE_EX lockState;
 	BOOLEAN				FreeBufAfterWrite;
 	PNET_BUFFER_LIST    pNetBufList;
 	PNET_BUFFER_LIST    pNextNetBufList;
@@ -909,7 +887,7 @@ Return Value:
 			NPF_FreePackets(pNetBufList);
 
 			/* Lock the group */
-			NdisAcquireReadWriteLock(&pFiltMod->OpenInstancesLock, FALSE, &lockState);
+			NdisAcquireRWLockRead(pFiltMod->OpenInstancesLock, &lockState, 0);
 
 			for (Curr = pFiltMod->OpenInstances.Next; Curr != NULL; Curr = Curr->Next)
 			{
@@ -922,7 +900,7 @@ Return Value:
 
 			}
 			/* Release the spin lock no matter what. */
-			NdisReleaseReadWriteLock(&pFiltMod->OpenInstancesLock, &lockState);
+			NdisReleaseRWLock(pFiltMod->OpenInstancesLock, &lockState);
 		}
 		else
 		{

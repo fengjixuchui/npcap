@@ -430,30 +430,7 @@ DriverEntry(
 		}
 		pFiltMod->Loopback = TRUE;
 		pFiltMod->MaxFrameSize = NPF_LOOPBACK_INTERFACR_MTU + ETHER_HDR_LEN;
-		Status = PsCreateSystemThread(&threadHandle, THREAD_ALL_ACCESS,
-				NULL, NULL, NULL, NPF_WriterThread, pFiltMod);
-		if (Status != STATUS_SUCCESS)
-		{
-			NPF_ReleaseFilterModuleResources(pFiltMod);
-			ExFreePool(pFiltMod);
-#ifndef NPCAP_READ_ONLY
-			NPF_WSKFreeSockets();
-			NPF_WSKCleanup();
-#endif
-			TRACE_EXIT();
-			return Status;
-		}
 
-		// Convert the Thread object handle into a pointer to the Thread object
-		// itself. Then close the handle.
-		ObReferenceObjectByHandle(threadHandle,
-			THREAD_ALL_ACCESS,
-			NULL,
-			KernelMode,
-			&pFiltMod->WriterThreadObj,
-			NULL);
-
-		ZwClose(threadHandle);
 		// No need to mess with SendToRx/BlockRx, packet filters, NDIS filter characteristics, Dot11, etc.
 		NPF_AddToFilterModuleArray(pFiltMod);
 	}
@@ -915,12 +892,6 @@ Return Value:
 	// NdisFreeString(g_NPF_Prefix);
 }
 
-VOID
-NPF_ResetBufferContents(
-	IN POPEN_INSTANCE Open,
-	IN BOOLEAN AcquireLock
-);
-
 #define SET_RESULT_SUCCESS(__a__) do{\
 	Information = __a__;	\
 	Status = STATUS_SUCCESS;	\
@@ -981,7 +952,7 @@ NPF_IoControl(
 
 	HANDLE					hUserEvent;
 	PKEVENT					pKernelEvent;
-	LOCK_STATE lockState;
+	LOCK_STATE_EX lockState;
 #ifdef _AMD64_
 	VOID* POINTER_32		hUserEvent32Bit;
 #endif //_AMD64_
@@ -1017,12 +988,15 @@ NPF_IoControl(
 		// processing packets
 		case BIOCSETBUFFERSIZE:
 		case BIOCSMODE:
-		// These functions require an attached adapter
 		case BIOCSENDPACKETSSYNC:
 		case BIOCSENDPACKETSNOSYNC:
+			MaxState = OpenRunning;
+			break;
+		// These functions require an attached adapter, but do not have
+		// to have support for capture/injection
 		case BIOCSETOID:
 		case BIOCQUERYOID:
-			MaxState = OpenRunning;
+			MaxState = OpenAttached;
 			break;
 		default:
 			// All others can work with detached instance
@@ -1151,7 +1125,7 @@ NPF_IoControl(
 		}
 
 		// Lock the BPF engine for writing. 
-		NdisAcquireReadWriteLock(&Open->MachineLock, TRUE, &lockState);
+		NdisAcquireRWLockWrite(Open->MachineLock, &lockState, 0);
 
 		do
 		{
@@ -1218,7 +1192,7 @@ NPF_IoControl(
 		//
 		// release the machine lock and then reset the buffer
 		//
-		NdisReleaseReadWriteLock(&Open->MachineLock, &lockState);
+		NdisReleaseRWLock(Open->MachineLock, &lockState);
 
 		NPF_ResetBufferContents(Open, TRUE);
 
@@ -1509,39 +1483,16 @@ NPF_IoControl(
 			break;
 		}
 
-		// Reallocate the buffer.
-		if (dim < sizeof(struct bpf_hdr))
-		{
-			dim = 0;
-		}
-		else
-		{
-			tpointer = ExAllocatePoolWithTag(NonPagedPool, dim, '6PWA');
-			if (tpointer == NULL)
-			{
-				// no memory
-				SET_FAILURE(STATUS_INSUFFICIENT_RESOURCES);
-				break;
-			}
-		}
-
 		// Acquire buffer lock
-		NdisAcquireReadWriteLock(&Open->BufferLock, TRUE, &lockState);
+		NdisAcquireRWLockWrite(Open->BufferLock, &lockState, 0);
 
-		//
-		// free the old buffer, if any
-		//
-		if (Open->Buffer != NULL)
-		{
-			ExFreePool(Open->Buffer);
-			Open->Buffer = NULL;
-		}
-
-		Open->Buffer = (PUCHAR)tpointer; // May be NULL if dim == 0;
+		// TODO: Could we avoid clearing the buffer but instead allow a
+		// negative Free count or maybe just clear out the amount that
+		// exceeds Size?
 		Open->Size = dim;
 		NPF_ResetBufferContents(Open, FALSE);
 
-		NdisReleaseReadWriteLock(&Open->BufferLock, &lockState);
+		NdisReleaseRWLock(Open->BufferLock, &lockState);
 
 		SET_RESULT_SUCCESS(0);
 		break;
@@ -1613,29 +1564,10 @@ NPF_IoControl(
 		OidData = Irp->AssociatedIrp.SystemBuffer;
 		TRACE_MESSAGE3(PACKET_DEBUG_LOUD, "%s Request: Oid=%08lx, Length=%08lx", FunctionCode == BIOCQUERYOID ? "BIOCQUERYOID" : "BIOCSETOID", OidData->Oid, OidData->Length);
 
-		//
-		// gain ownership of the Ndis Handle
-		//
-		if (!Open->pFiltMod || NPF_StartUsingBinding(Open->pFiltMod) == FALSE)
-		{
-			//
-			// MAC unbindind or unbound
-			//
-			TRACE_MESSAGE1(PACKET_DEBUG_LOUD, "Open->pFiltMod is unavailable or cannot bind, Open->pFiltMod=%p", Open->pFiltMod);
-			SET_FAILURE(STATUS_INVALID_DEVICE_REQUEST);
-			break;
-		}
-
-
 		// Extract a request from the list of free ones
 		pRequest = NPF_POOL_GET(Open->pFiltMod->InternalRequestPool, PINTERNAL_REQUEST);
 		if (pRequest == NULL)
 		{
-			//
-			// Release ownership of the Ndis Handle
-			//
-			NPF_StopUsingBinding(Open->pFiltMod);
-
 			TRACE_MESSAGE(PACKET_DEBUG_LOUD, "pRequest=NULL");
 			SET_FAILURE(STATUS_INSUFFICIENT_RESOURCES);
 			break;
@@ -1809,7 +1741,7 @@ NPF_IoControl(
 					goto OID_REQUEST_DONE;
 				}
 				// Set the filter module's packet filter to the union of all instances' filters
-				NdisAcquireReadWriteLock(&Open->pFiltMod->OpenInstancesLock, FALSE, &lockState);
+				NdisAcquireRWLockRead(Open->pFiltMod->OpenInstancesLock, &lockState, 0);
 				// Stash the old filter
 				dim = Open->pFiltMod->MyPacketFilter;
 				Open->pFiltMod->MyPacketFilter = 0;
@@ -1817,7 +1749,7 @@ NPF_IoControl(
 				{
 					Open->pFiltMod->MyPacketFilter |= CONTAINING_RECORD(Curr, OPEN_INSTANCE, OpenInstancesEntry)->MyPacketFilter;
 				}
-				NdisReleaseReadWriteLock(&Open->pFiltMod->OpenInstancesLock, &lockState);
+				NdisReleaseRWLock(Open->pFiltMod->OpenInstancesLock, &lockState);
 
 				// If the new packet filter is the same as the old one...
 				if (Open->pFiltMod->MyPacketFilter == dim
@@ -1905,12 +1837,8 @@ NPF_IoControl(
 		}
 
 OID_REQUEST_DONE:
-		//
-		// Release ownership of the Ndis Handle
-		//
-		NPF_StopUsingBinding(Open->pFiltMod);
 
-		NPF_POOL_RETURN(Open->pFiltMod->InternalRequestPool, pRequest);
+		NPF_POOL_RETURN(Open->pFiltMod->InternalRequestPool, pRequest, NULL);
 
 		break;
 
@@ -1964,29 +1892,4 @@ OID_REQUEST_DONE:
 	TRACE_MESSAGE1(PACKET_DEBUG_LOUD, "Status = %#x", Status);
 	TRACE_EXIT();
 	return Status;
-}
-
-//-------------------------------------------------------------------
-
-VOID
-NPF_ResetBufferContents(
-	IN POPEN_INSTANCE Open,
-	IN BOOLEAN AcquireLock
-	)
-{
-	LOCK_STATE lockState;
-	if (AcquireLock)
-		NdisAcquireReadWriteLock(&Open->BufferLock, TRUE, &lockState);
-	Open->Accepted = 0;
-	Open->Dropped = 0;
-	Open->Received = 0;
-
-	//
-	// reset their pointers
-	//
-	Open->C = 0;
-	Open->P = 0;
-	Open->Free = Open->Size;
-	if (AcquireLock)
-		NdisReleaseReadWriteLock(&Open->BufferLock, &lockState);
 }

@@ -276,6 +276,15 @@ typedef enum _OPEN_STATE
 	OpenClosed // No features available, about to shut down
 } OPEN_STATE;
 
+typedef enum _FILTER_OPS_STATE
+{
+	OpsDisabled,
+	OpsDisabling,
+	OpsEnabling,
+	OpsFailed,
+	OpsEnabled
+} FILTER_OPS_STATE;
+
 #define OPEN_SIGNATURE 'NPFO'
 
 /* Filter module (per-adapter) */
@@ -285,15 +294,10 @@ typedef struct _NPCAP_FILTER_MODULE
 	// List of open instances needs to be write-locked only when inserting/removing.
 	// Ordinary traversal can use faster and concurrent read-lock.
 	SINGLE_LIST_ENTRY OpenInstances; //GroupHead
-	NDIS_RW_LOCK OpenInstancesLock; // GroupLock
+	PNDIS_RW_LOCK_EX OpenInstancesLock; // GroupLock
 
-	LIST_ENTRY WriterRequestList; // Head of writer thread request queue
-	KSPIN_LOCK WriterRequestLock; // Lock controlling request queue
-	KSEMAPHORE WriterSemaphore; // Semaphore to signal writer thread of new requests
-	BOOLEAN WriterShouldStop; // Flag to kill writer thread
-	PVOID WriterThreadObj; // Pointer to the writer thread itself.
-	PNPF_OBJ_POOL WriterRequestPool; // Pool of request objects
-	PNPF_OBJ_POOL NBCopiesPool; // Pool of NET_BUFFER copy objects
+	PNPF_OBJ_POOL NBLCopyPool; // Pool of NPF_NBL_COPY objects
+	PNPF_OBJ_POOL NBCopiesPool; // Pool of NPF_NB_COPIES objects
 
 	NDIS_STRING				AdapterName;
 #ifdef HAVE_WFP_LOOPBACK_SUPPORT
@@ -331,6 +335,7 @@ typedef struct _NPCAP_FILTER_MODULE
 	ULONG					AdapterHandleUsageCounter;
 	NDIS_SPIN_LOCK			AdapterHandleLock;
 	FILTER_STATE					AdapterBindingStatus;	///< Specifies if NPF is still bound to the adapter used by this instance, it's unbinding or it's not bound.
+	FILTER_OPS_STATE OpsState; // Whether all operations are enabled
 
 } 
 NPCAP_FILTER_MODULE, *PNPCAP_FILTER_MODULE;
@@ -386,13 +391,13 @@ typedef struct _OPEN_INSTANCE
 											///< reached.
 #endif
 
-	NDIS_RW_LOCK MachineLock; ///< Lock that protects the BPF filter while in use.
+	PNDIS_RW_LOCK_EX MachineLock; ///< Lock that protects the BPF filter while in use.
 
 	/* Buffer */
-	PUCHAR Buffer; // The kernel ring buffer
-	NDIS_RW_LOCK BufferLock; // Lock for modifying the buffer size/configuration
-	ULONG C; // Consumer's index in the buffer
-	ULONG P; // Producer's index in the buffer
+	PNPF_OBJ_POOL CapturePool; // Pool of NPF_CAP_DATA objects
+	PNDIS_RW_LOCK_EX BufferLock; // Lock for modifying the buffer size/configuration
+	LIST_ENTRY PacketQueue; // Head of packet buffer queue
+	KSPIN_LOCK PacketQueueLock; // Lock controlling buffer queue
 	ULONG Free; // Bytes of buffer free for writing
 
 	/* Stats */
@@ -427,48 +432,61 @@ typedef enum
 	NPF_WRITER_FREE_MEM,
 } NPF_WRITER_FUNCTION_CODE;
 
-/* Structure of a serialized request to the writer thread */
-typedef struct _NPF_WRITER_REQUEST
-{
-	LIST_ENTRY WriterRequestEntry;
-	NPF_WRITER_FUNCTION_CODE FunctionCode;
-	POPEN_INSTANCE pOpen;
-	PNET_BUFFER_LIST pNBL;
-	PNET_BUFFER pNetBuffer;
-	struct bpf_hdr BpfHeader;
-	PVOID pBuffer;
-	SINGLE_LIST_ENTRY NBCopiesHead;
-}
-NPF_WRITER_REQUEST, *PNPF_WRITER_REQUEST;
-
-// no idea really, but Nmap uses this snaplen.
+/* This value should be sized to hold most packets processed by the driver. If
+ * a packet (snaplen) exceeds this size, it will cost an additional buffer+MDL
+ * allocation/free. On the other hand, every captured packet will use up at
+ * least this much space in memory, so keep it small. Nmap uses 256 snaplen, so
+ * we'll try that.
+ */
 #define NPF_NBCOPY_INITIAL_DATA_SIZE 256
+
+typedef struct _NPF_NBL_COPY
+{
+	SINGLE_LIST_ENTRY NBCopiesHead;
+	SINGLE_LIST_ENTRY NBLCopyEntry;
+	PNPCAP_FILTER_MODULE pFiltMod;
+#ifdef HAVE_DOT11_SUPPORT
+	PUCHAR Dot11RadiotapHeader;
+#endif
+} NPF_NBL_COPY, *PNPF_NBL_COPY;
+
+VOID NPF_FreeNBLCopy(PNPF_NBL_COPY pNBLCopy);
 
 typedef struct _NPF_NB_COPIES
 {
 	SINGLE_LIST_ENTRY CopiesEntry;
+	PNPF_NBL_COPY pNBLCopy;
 	PNET_BUFFER pNetBuffer; // May be NULL, hence why we can't just use NET_BUFFER.Next
+	ULONG ulSize; //Size of all allocated space in the netbuffer.
 } NPF_NB_COPIES, *PNPF_NB_COPIES;
 
-VOID NPF_QueueRequest(PNPCAP_FILTER_MODULE pFiltMod,
-	PNPF_WRITER_REQUEST pReq);
+VOID NPF_FreeNBCopies(PNPF_NB_COPIES pNBCopy);
 
-VOID NPF_QueuedFree(
-	PNPCAP_FILTER_MODULE pFiltMod,
-	NPF_WRITER_FUNCTION_CODE FunctionCode,
-	PNET_BUFFER_LIST pNBL,
-	PVOID pItem,
-	ULONG ulSize
-	);
+/* Structure of a captured packet data description */
+typedef struct _NPF_CAP_DATA
+{
+	LIST_ENTRY PacketQueueEntry;
+	PNPF_NB_COPIES pNBCopy;
+	struct bpf_hdr BpfHeader;
+}
+NPF_CAP_DATA, *PNPF_CAP_DATA;
 
-VOID NPF_PurgeRequests(PNPCAP_FILTER_MODULE pFiltMod,
-	PNET_BUFFER_LIST pNBL,
-	POPEN_INSTANCE pOpen);
+VOID NPF_FreeCapData(PNPF_CAP_DATA pCapData);
 
-VOID NPF_FillBuffer(POPEN_INSTANCE pOpen,
-	PNET_BUFFER pNB,
-	struct bpf_hdr *pBpfHeader,
-	PUCHAR pDot11Data);
+#ifdef HAVE_DOT11_SUPPORT
+#define NPF_CAP_SIZE(_P, _R) ((_P)->BpfHeader.bh_hdrlen \
+		+ (_P)->BpfHeader.bh_caplen \
+		+ (_R != NULL ? _R->it_len : 0))
+#else
+#define NPF_CAP_SIZE(_P, _N) ((_P)->BpfHeader.bh_hdrlen \
+		+ (_P)->BpfHeader.bh_caplen)
+#endif
+
+VOID
+NPF_ResetBufferContents(
+	IN POPEN_INSTANCE Open,
+	IN BOOLEAN AcquireLock
+);
 
 /*!
 \brief Context information for originated sent packets
@@ -858,6 +876,7 @@ NPF_SetPacketFilter(
   NOTE: this assumes that the calling routine ensures validity
   of the filter handle until this returns.
 */
+_IRQL_requires_(PASSIVE_LEVEL)
 NDIS_STATUS
 NPF_DoInternalRequest(
 	_In_ NDIS_HANDLE					FilterModuleContext,
@@ -1026,6 +1045,7 @@ DRIVER_DISPATCH NPF_CloseAdapter;
   \param pFiltMod Pointer to a filter module where the packets should be captured
   \param pNetBufferLists A List of NetBufferLists to receive.
   \param pOpenOriginating A pointer to the OpenInstance that originated/injected these packets so SkipSentPackets can be honored. NULL if not applicable.
+  \param AtDispatchLevel Set to TRUE if the caller knows they are at DISPATCH_LEVEL.
 
   NPF_DoTap() is called for every incoming and outgoing packet. It is the most important and one of
   the most complex functions of NPF: it executes the filter, runs the statistical engine (if the instance is in
@@ -1037,7 +1057,8 @@ VOID
 NPF_DoTap(
 	PNPCAP_FILTER_MODULE pFiltMod,
 	PNET_BUFFER_LIST NetBufferLists,
-	POPEN_INSTANCE pOpenOriginating
+	POPEN_INSTANCE pOpenOriginating,
+	BOOLEAN AtDispatchLevel
 	);
 
 /*!
@@ -1086,6 +1107,7 @@ DRIVER_DISPATCH NPF_IoControl;
   packet can be sent for performance reasons.
 */
 _Dispatch_type_(IRP_MJ_WRITE)
+_IRQL_requires_max_(PASSIVE_LEVEL)
 DRIVER_DISPATCH NPF_Write;
 // NTSTATUS
 // NPF_Write(

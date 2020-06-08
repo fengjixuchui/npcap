@@ -1,4 +1,61 @@
 ﻿
+## Npcap 0.9993 [2020-06-05]
+
+* Fix a BSoD crash in `NPF_DoInternalRequest` triggered by suspending the
+  system while a capture is running. Added source annotations to allow static
+  analysis to catch bugs like this in the future. Fixes [#181](http://issues.npcap.org/181).
+
+* Fix a bug introduced in Npcap 0.9992 which caused loopback capture to fail if
+  any loopback capture had been previously started and finished.
+
+* Fix packet length calculation for loopback capture. The packet length was
+  being counted twice, leading to junk data being appended to captured packets.
+
+* If installation fails for any reason other than a failure to uninstall the
+  previous version of Npcap, the current version's uninstaller will be used to
+  clean up any partial installation. The only remaining files will be the
+  `install.log` and `NPFInstall.log` in the  Npcap installation directory.
+
+* Replaced ReadWriteLock mechanisms with improved `NDIS_RW_LOCK_EX` new in NDIS
+  6.20 for improved performance.
+
+* Moved object pool for captured packets from the filter module (adapter)
+  object to the open instance (pcap handle) to allow memory to be recovered
+  after a capture is closed.
+
+## Npcap 0.9992 [2020-06-03]
+
+* Npcap issues are now tracked on [their own Github Issues
+  page](http://issues.npcap.org), separate from Nmap issues. Many existing
+  issues have been migrated, and issue numbers may have changed.
+
+* Rewrote the kernel packet capture buffer code again to avoid requiring a
+  separate worker thread. Instead, captured packets are held directly in a
+  synchronized queue. The worker thread introduced in Npcap 0.9991 was unable
+  to keep up with the volume of packet requests, leading to buffer bloat and
+  reduced performance.
+
+* Avoid initializing loopback capture-related functions and processing packets
+  as soon as an adapter is opened. This will improve performance since adapters
+  are opened as part of listing adapters.
+
+* Fix a crash in NPFInstall.exe when terminating processes which are using
+  Npcap resources. This could lead to failed installations and message windows
+  about "A LWF & WFP driver installation tool has stopped working."
+
+* Update Npcap from NDIS 6.10 to NDIS 6.20, which limits its compatibility to
+  Windows 7 and higher. Closes [#167](http://issues.npcap.org/167).
+
+* Fix a bug in Npcap 0.9991 which prevented packets from being captured until a
+  BPF filter had been set. Fixes [#168](http://issues.npcap.org/168) (migrated
+  from nmap/nmap#2037).
+
+* Allow capture statistics and captured packets remaining in the buffer to be
+  retrieved when an adapter is removed. Fixes [nmap/nmap#2036](https://issues.nmap.org/2036).
+
+* Use WMI instead of the Windows 10-only `Get-NetAdapter` Powershell cmdlet in
+  the DiagReport tool. Fixes [nmap/nmap#611](https://issues.nmap.org/611).
+
 ## Npcap 0.9991 [2020-05-04]
 
 * Switched our code signing certificate back to DigiCert after some users found
