@@ -364,7 +364,7 @@ NPF_Read(
 		InterlockedExchangeAdd(&Open->Free, NPF_CAP_SIZE(pCapData, pRadiotapHeader));
 
 		// Return this capture data
-		NPF_POOL_RETURN(Open->CapturePool, pCapData, NPF_FreeCapData);
+		NPF_ObjectPoolReturn(Open->CapturePool, pCapData, NPF_FreeCapData);
 
 		ASSERT(Open->Free <= Open->Size);
 	}
@@ -389,12 +389,14 @@ NPF_Read(
 //-------------------------------------------------------------------
 VOID
 NPF_TapExForEachOpen(
-	IN POPEN_INSTANCE Open,
-	IN PNET_BUFFER_LIST pNetBufferLists,
-	IN PSINGLE_LIST_ENTRY NBLCopyHead,
-	IN BOOLEAN AtDispatchLevel
+	_In_ POPEN_INSTANCE Open,
+	_In_ PNET_BUFFER_LIST pNetBufferLists,
+	_Inout_ PSINGLE_LIST_ENTRY NBLCopyHead,
+	_Inout_ struct timeval *tstamp,
+	_In_ BOOLEAN AtDispatchLevel
 	);
 
+_Use_decl_annotations_
 VOID
 NPF_DoTap(
 	PNPCAP_FILTER_MODULE pFiltMod,
@@ -408,6 +410,7 @@ NPF_DoTap(
 	LOCK_STATE_EX lockState;
 	PNPF_NBL_COPY pNBLCopy = NULL;
 	SINGLE_LIST_ENTRY NBLCopiesHead;
+	struct timeval tstamp = {0, 0};
 	NBLCopiesHead.Next = NULL;
 
 	/* Lock the group */
@@ -423,7 +426,7 @@ NPF_DoTap(
 			// If this instance originated the packet and doesn't want to see it, don't capture.
 			if (!(TempOpen == pOpenOriginating && TempOpen->SkipSentPackets))
 			{
-				NPF_TapExForEachOpen(TempOpen, NetBufferLists, &NBLCopiesHead, AtDispatchLevel);
+				NPF_TapExForEachOpen(TempOpen, NetBufferLists, &NBLCopiesHead, &tstamp, AtDispatchLevel);
 			}
 		}
 	}
@@ -433,7 +436,7 @@ NPF_DoTap(
 	for (Curr = NBLCopiesHead.Next; Curr != NULL; Curr = Curr->Next)
 	{
 		pNBLCopy = CONTAINING_RECORD(Curr, NPF_NBL_COPY, NBLCopyEntry); 
-		NPF_POOL_RETURN(pFiltMod->NBLCopyPool, pNBLCopy, NPF_FreeNBLCopy);
+		NPF_ObjectPoolReturn(pFiltMod->NBLCopyPool, pNBLCopy, NPF_FreeNBLCopy);
 	}
 
 	return;
@@ -548,12 +551,14 @@ NPF_AlignProtocolField(
 
 //-------------------------------------------------------------------
 
+_Use_decl_annotations_
 VOID
 NPF_TapExForEachOpen(
-	IN POPEN_INSTANCE Open,
-	IN PNET_BUFFER_LIST pNetBufferLists,
-	IN PSINGLE_LIST_ENTRY NBLCopyHead,
-	IN BOOLEAN AtDispatchLevel
+	POPEN_INSTANCE Open,
+	PNET_BUFFER_LIST pNetBufferLists,
+	PSINGLE_LIST_ENTRY NBLCopyHead,
+	struct timeval *tstamp,
+	BOOLEAN AtDispatchLevel
 	)
 {
 	UINT					fres;
@@ -570,6 +575,7 @@ NPF_TapExForEachOpen(
 	PNPF_NBL_COPY pNBLCopy = NULL;
 	PSINGLE_LIST_ENTRY pNBLCopyPrev = NBLCopyHead;
 	PSINGLE_LIST_ENTRY pNBCopiesPrev = NULL;
+	ASSERT(tstamp != NULL);
 	
 	//TRACE_ENTER();
 
@@ -593,7 +599,7 @@ NPF_TapExForEachOpen(
 		if (pNBLCopyPrev->Next == NULL)
 		{
 			// Add another NBL copy to the chain
-			pNBLCopy = NPF_POOL_GET(Open->pFiltMod->NBLCopyPool, PNPF_NBL_COPY);
+			pNBLCopy = (PNPF_NBL_COPY) NPF_ObjectPoolGet(Open->pFiltMod->NBLCopyPool);
 			if (pNBLCopy == NULL)
 			{
 				//Insufficient resources.
@@ -609,6 +615,8 @@ NPF_TapExForEachOpen(
 		{
 			pNBLCopy = CONTAINING_RECORD(pNBLCopyPrev->Next, NPF_NBL_COPY, NBLCopyEntry);
 		}
+		pNBLCopyPrev = pNBLCopyPrev->Next;
+
 		// Informational headers
 		// Only bother with these if we are capturing, i.e. not MODE_STAT
 		if (Open->mode & MODE_DUMP || !(Open->mode & MODE_STAT))
@@ -650,14 +658,14 @@ NPF_TapExForEachOpen(
 					goto RadiotapDone;
 				}
 
-				pNBLCopy->Dot11RadiotapHeader = NPF_POOL_GET(Open->pFiltMod->Dot11HeaderPool, PUCHAR);
-				RtlZeroMemory(pNBLCopy->Dot11RadiotapHeader, SIZEOF_RADIOTAP_BUFFER);
+				pNBLCopy->Dot11RadiotapHeader = (PUCHAR) NPF_ObjectPoolGet(Open->pFiltMod->Dot11HeaderPool);
 				if (pNBLCopy->Dot11RadiotapHeader == NULL)
 				{
 					// Insufficient memory
 					// TODO: Count this as a drop?
 					goto RadiotapDone;
 				}
+				RtlZeroMemory(pNBLCopy->Dot11RadiotapHeader, SIZEOF_RADIOTAP_BUFFER);
 				pRadiotapHeader = (PIEEE80211_RADIOTAP_HEADER) pNBLCopy->Dot11RadiotapHeader;
 
 				// The radiotap header is also placed in the buffer.
@@ -814,7 +822,7 @@ NPF_TapExForEachOpen(
 			if (pNBCopiesPrev->Next == NULL)
 			{
 				// Add another copy to the chain
-				pNBCopy = NPF_POOL_GET(Open->pFiltMod->NBCopiesPool, PNPF_NB_COPIES);
+				pNBCopy = (PNPF_NB_COPIES) NPF_ObjectPoolGet(Open->pFiltMod->NBCopiesPool);
 				if (pNBCopy == NULL)
 				{
 					//Insufficient resources.
@@ -842,10 +850,10 @@ NPF_TapExForEachOpen(
 			TotalPacketSize = NET_BUFFER_DATA_LENGTH(pNetBuf);
 
 			fres = bpf_filter((struct bpf_insn *)(Open->bpfprogram),
-					NET_BUFFER_FIRST_MDL(pNetBuf),
+					NET_BUFFER_CURRENT_MDL(pNetBuf),
 					NET_BUFFER_CURRENT_MDL_OFFSET(pNetBuf),
 					TotalPacketSize);
-			IF_LOUD(DbgPrint("\nFirst MDL length = %d, Packet Size = %d, fres = %d\n", MmGetMdlByteCount(NET_BUFFER_FIRST_MDL(pNetBuf)), TotalPacketSize, fres);)
+			IF_LOUD(DbgPrint("\nCurrent MDL length = %d, Packet Size = %d, fres = %d\n", MmGetMdlByteCount(NET_BUFFER_CURRENT_MDL(pNetBuf)), TotalPacketSize, fres);)
 
 			NdisReleaseRWLock(Open->MachineLock, &lockState);
 
@@ -940,7 +948,9 @@ NPF_TapExForEachOpen(
 					goto TEFEO_release_BufferLock;
 				}
 				pNBCopy->ulSize = NPF_NBCOPY_INITIAL_DATA_SIZE;
-				NET_BUFFER_CURRENT_MDL_OFFSET(pNBCopy->pNetBuffer) = 0;
+				NET_BUFFER_DATA_OFFSET(pNBCopy->pNetBuffer) = 0;
+				NET_BUFFER_DATA_LENGTH(pNBCopy->pNetBuffer) = 0;
+				NdisAdjustNetBufferCurrentMdl(pNBCopy->pNetBuffer);
 			}
 			ULONG OldLength = NET_BUFFER_DATA_LENGTH(pNBCopy->pNetBuffer);
 
@@ -977,6 +987,7 @@ NPF_TapExForEachOpen(
 						dropped++;
 						goto TEFEO_release_BufferLock;
 					}
+					pNBCopy->ulSize += toAlloc;
 				}
 				// Now the NB has enough space.
 				ULONG BytesCopied = 0;
@@ -990,7 +1001,7 @@ NPF_TapExForEachOpen(
 				NET_BUFFER_DATA_LENGTH(pNBCopy->pNetBuffer) = fres;
 			}
 
-			PNPF_CAP_DATA pCapData = NPF_POOL_GET(Open->CapturePool, PNPF_CAP_DATA);
+			PNPF_CAP_DATA pCapData = (PNPF_CAP_DATA) NPF_ObjectPoolGet(Open->CapturePool);
 			if (pCapData == NULL)
 			{
 				// Insufficient memory
@@ -1001,10 +1012,16 @@ NPF_TapExForEachOpen(
 			RtlZeroMemory(pCapData, sizeof(NPF_CAP_DATA));
 			// Increment refcounts on relevant structures
 			pCapData->pNBCopy = pNBCopy;
-			NPF_POOL_REFERENCE(pNBCopy);
-			NPF_POOL_REFERENCE(pNBLCopy);
+			NPF_ReferenceObject(pNBCopy);
+			NPF_ReferenceObject(pNBLCopy);
 
-			GET_TIME(&pCapData->BpfHeader.bh_tstamp, &Open->start, Open->TimestampMode);
+			if (tstamp->tv_sec == 0)
+			{
+				// We only get the timestamp once for all packets in this set of NBLs
+				// since they were all delivered at the same time.
+				GET_TIME(tstamp, &Open->start, Open->TimestampMode);
+			}
+			pCapData->BpfHeader.bh_tstamp = *tstamp;
 			pCapData->BpfHeader.bh_caplen = fres;
 			pCapData->BpfHeader.bh_datalen = TotalPacketSize;
 			pCapData->BpfHeader.bh_hdrlen = sizeof(struct bpf_hdr);

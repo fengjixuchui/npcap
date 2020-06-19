@@ -51,6 +51,16 @@
 
 // TODO: Implement a way to shrink the pool occasionally?
 
+/* Objects in the pool are retrieved and returned using this struct.
+ * pObject is an uninitialized array of ulObjectSize bytes.
+ */
+typedef struct _NPF_OBJ_POOL_ELEM
+{
+	LIST_ENTRY ObjectsEntry;
+	ULONG Refcount;
+	UCHAR pObject[];
+} NPF_OBJ_POOL_ELEM, *PNPF_OBJ_POOL_ELEM;
+
 typedef struct _NPF_OBJ_SHELF
 {
 	LIST_ENTRY ShelfEntry;
@@ -73,7 +83,10 @@ typedef struct _NPF_OBJ_POOL
 #define NPF_OBJ_ELEM_ALLOC_SIZE(POOL) (sizeof(NPF_OBJ_POOL_ELEM) + (POOL)->ulObjectSize)
 #define NPF_OBJ_SHELF_ALLOC_SIZE(POOL) ( sizeof(NPF_OBJ_SHELF) + NPF_OBJ_ELEM_ALLOC_SIZE(POOL) * (POOL)->ulIncrement)
 
-BOOLEAN NPF_ExtendObjectShelf(PNPF_OBJ_POOL pPool)
+_Success_(return != 0)
+BOOLEAN
+NPF_ExtendObjectShelf(
+		_In_ PNPF_OBJ_POOL pPool)
 {
 	PNPF_OBJ_SHELF pShelf = NULL;
 	PNPF_OBJ_POOL_ELEM pElem = NULL;
@@ -101,6 +114,7 @@ BOOLEAN NPF_ExtendObjectShelf(PNPF_OBJ_POOL pPool)
 	return TRUE;
 }
 
+_Use_decl_annotations_
 PNPF_OBJ_POOL NPF_AllocateObjectPool(NDIS_HANDLE NdisHandle, ULONG ulObjectSize, ULONG ulIncrement)
 {
 	PNPF_OBJ_POOL pPool = NULL;
@@ -127,7 +141,8 @@ PNPF_OBJ_POOL NPF_AllocateObjectPool(NDIS_HANDLE NdisHandle, ULONG ulObjectSize,
 	return pPool;
 }
 
-PNPF_OBJ_POOL_ELEM NPF_ObjectPoolGet(PNPF_OBJ_POOL pPool)
+_Use_decl_annotations_
+PVOID NPF_ObjectPoolGet(PNPF_OBJ_POOL pPool)
 {
 	PNPF_OBJ_POOL_ELEM pElem = NULL;
 	PLIST_ENTRY pEntry = ExInterlockedRemoveHeadList(&pPool->ObjectsHead, &pPool->ObjectsLock);
@@ -147,9 +162,10 @@ PNPF_OBJ_POOL_ELEM NPF_ObjectPoolGet(PNPF_OBJ_POOL pPool)
 
 	pElem = CONTAINING_RECORD(pEntry, NPF_OBJ_POOL_ELEM, ObjectsEntry);
 	pElem->Refcount = 1;
-	return pElem;
+	return pElem->pObject;
 }
 
+_Use_decl_annotations_
 VOID NPF_FreeObjectPool(PNPF_OBJ_POOL pPool)
 {
 	PLIST_ENTRY pShelfEntry = NULL;
@@ -164,8 +180,10 @@ VOID NPF_FreeObjectPool(PNPF_OBJ_POOL pPool)
 	NdisFreeMemory(pPool, sizeof(NPF_OBJ_POOL), 0);
 }
 
-VOID NPF_ObjectPoolReturn(PNPF_OBJ_POOL pPool, PNPF_OBJ_POOL_ELEM pElem, PNPF_OBJ_CLEANUP CleanupFunc)
+_Use_decl_annotations_
+VOID NPF_ObjectPoolReturn(PNPF_OBJ_POOL pPool, PVOID pObject, PNPF_OBJ_CLEANUP CleanupFunc)
 {
+	PNPF_OBJ_POOL_ELEM pElem = CONTAINING_RECORD(pObject, NPF_OBJ_POOL_ELEM, pObject);
 	ULONG refcount = InterlockedDecrement(&pElem->Refcount);
 	if (refcount == 0)
 	{
@@ -179,7 +197,10 @@ VOID NPF_ObjectPoolReturn(PNPF_OBJ_POOL pPool, PNPF_OBJ_POOL_ELEM pElem, PNPF_OB
 	}
 }
 
-VOID NPF_ReferenceObject(PNPF_OBJ_POOL_ELEM pElem)
+_Use_decl_annotations_
+VOID NPF_ReferenceObject(PVOID pObject)
 {
+	PNPF_OBJ_POOL_ELEM pElem = CONTAINING_RECORD(pObject, NPF_OBJ_POOL_ELEM, pObject);
+
 	InterlockedIncrement(&pElem->Refcount);
 }

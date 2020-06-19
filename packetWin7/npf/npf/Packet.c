@@ -158,7 +158,7 @@ PQUERYSYSTEMTIME g_ptrQuerySystemTime = NULL;
 // this function wraps the macro execution.
 void
 KeQuerySystemTimeWrapper(
-	PLARGE_INTEGER CurrentTime
+	_Out_ PLARGE_INTEGER CurrentTime
 )
 {
 	KeQuerySystemTime(CurrentTime);
@@ -171,6 +171,7 @@ KeQuerySystemTimeWrapper(
 _Dispatch_type_(IRP_MJ_WRITE)
 DRIVER_DISPATCH NPF_Deny;
 
+_Use_decl_annotations_
 NTSTATUS NPF_Deny(
 		IN PDEVICE_OBJECT DeviceObject,
 		IN PIRP Irp
@@ -185,6 +186,41 @@ NTSTATUS NPF_Deny(
 	return STATUS_UNSUCCESSFUL;
 }
 #endif
+
+/*!
+  \brief The initialization routine of the LWF data structure.
+  \param pFChars The LWF data structure.
+  \param bWiFiOrNot Whether the LWF is registered as a WiFi one or standard one.
+  \return NULL
+*/
+VOID
+NPF_registerLWF(
+	_Out_ PNDIS_FILTER_DRIVER_CHARACTERISTICS pFChars,
+	_In_ BOOLEAN bWiFiOrNot
+	);
+
+/*!
+  \brief read Npcap software's registry, get the option.
+
+  If the registry key doesn't exist, we view the result as 0.
+*/
+ULONG
+NPF_GetRegistryOption_Integer(
+	_In_ PUNICODE_STRING RegistryPath,
+	_In_ PUNICODE_STRING RegValueName
+	);
+
+/*!
+  \brief read Npcap software's registry, get the option
+
+  If NPF_GetLoopbackAdapterName() fails, g_LoopbackAdapterName will be NULL.
+*/
+VOID
+NPF_GetRegistryOption_String(
+	_In_ PUNICODE_STRING RegistryPath,
+	_In_ PUNICODE_STRING RegValueName,
+	_Inout_ PNDIS_STRING g_OutputString
+	);
 
 //-------------------------------------------------------------------
 //
@@ -394,48 +430,6 @@ DriverEntry(
 	devExtP->DetachedOpens.Next = NULL;
 	KeInitializeSpinLock(&devExtP->DetachedOpensLock);
 
-#ifdef HAVE_WFP_LOOPBACK_SUPPORT
-	if (g_LoopbackSupportMode) {
-#ifndef NPCAP_READ_ONLY
-		// Use Winsock Kernel (WSK) to send loopback packets.
-		// TODO: Allow this to continue but disable loopback if there's an error
-		Status = NPF_WSKStartup();
-		if (!NT_SUCCESS(Status))
-		{
-			TRACE_EXIT();
-			return Status;
-		}
-
-		Status = NPF_WSKInitSockets();
-		if (!NT_SUCCESS(Status))
-		{
-			NPF_WSKCleanup();
-			TRACE_EXIT();
-			return Status;
-		}
-#endif
-
-		// Create the fake "filter module" for loopback capture
-		// This is a hack to let NPF_CreateFilterModule create "\Device\NPCAP\Loopback" just like it usually does with a GUID
-		NDIS_STRING LoopbackDeviceName = NDIS_STRING_CONST("\\Device\\Loopback");
-		PNPCAP_FILTER_MODULE pFiltMod = NPF_CreateFilterModule(NULL, &LoopbackDeviceName, NdisMediumLoopback);
-		if (pFiltMod == NULL)
-		{
-#ifndef NPCAP_READ_ONLY
-			NPF_WSKFreeSockets();
-			NPF_WSKCleanup();
-#endif
-			TRACE_EXIT();
-			return NDIS_STATUS_RESOURCES;
-		}
-		pFiltMod->Loopback = TRUE;
-		pFiltMod->MaxFrameSize = NPF_LOOPBACK_INTERFACR_MTU + ETHER_HDR_LEN;
-
-		// No need to mess with SendToRx/BlockRx, packet filters, NDIS filter characteristics, Dot11, etc.
-		NPF_AddToFilterModuleArray(pFiltMod);
-	}
-#endif
-
 	/* Have to set this up before NdisFRegisterFilterDriver, since we can get Attach calls immediately after that! */
 	NdisAllocateSpinLock(&g_FilterArrayLock);
 
@@ -446,12 +440,6 @@ DriverEntry(
 		&FilterDriverHandle);
 	if (Status != NDIS_STATUS_SUCCESS)
 	{
-#ifdef HAVE_WFP_LOOPBACK_SUPPORT
-#ifndef NPCAP_READ_ONLY
-		NPF_WSKFreeSockets();
-		NPF_WSKCleanup();
-#endif
-#endif
 		NdisFreeSpinLock(&g_FilterArrayLock);
 		TRACE_MESSAGE1(PACKET_DEBUG_LOUD, "NdisFRegisterFilterDriver: failed to register filter with NDIS, Status = %x", Status);
 		TRACE_EXIT();
@@ -461,6 +449,46 @@ DriverEntry(
 	{
 		TRACE_MESSAGE2(PACKET_DEBUG_LOUD, "NdisFRegisterFilterDriver: succeed to register filter with NDIS, Status = %x, FilterDriverHandle = %p", Status, FilterDriverHandle);
 	}
+
+#ifdef HAVE_WFP_LOOPBACK_SUPPORT
+	if (g_LoopbackSupportMode) {
+		do {
+#ifndef NPCAP_READ_ONLY
+			// Use Winsock Kernel (WSK) to send loopback packets.
+			Status = NPF_WSKStartup();
+			if (!NT_SUCCESS(Status))
+			{
+				break;
+			}
+
+			Status = NPF_WSKInitSockets();
+			if (!NT_SUCCESS(Status))
+			{
+				NPF_WSKCleanup();
+				break;
+			}
+#endif
+
+			// Create the fake "filter module" for loopback capture
+			// This is a hack to let NPF_CreateFilterModule create "\Device\NPCAP\Loopback" just like it usually does with a GUID
+			NDIS_STRING LoopbackDeviceName = NDIS_STRING_CONST("\\Device\\Loopback");
+			PNPCAP_FILTER_MODULE pFiltMod = NPF_CreateFilterModule(FilterDriverHandle, &LoopbackDeviceName, NdisMediumLoopback);
+			if (pFiltMod == NULL)
+			{
+#ifndef NPCAP_READ_ONLY
+				NPF_WSKFreeSockets();
+				NPF_WSKCleanup();
+#endif
+				break;
+			}
+			pFiltMod->Loopback = TRUE;
+			pFiltMod->MaxFrameSize = NPF_LOOPBACK_INTERFACR_MTU + ETHER_HDR_LEN;
+
+			// No need to mess with SendToRx/BlockRx, packet filters, NDIS filter characteristics, Dot11, etc.
+			NPF_AddToFilterModuleArray(pFiltMod);
+		} while (0);
+	}
+#endif
 
 	if (g_Dot11SupportMode)
 	{
@@ -492,6 +520,7 @@ DriverEntry(
 }
 
 //-------------------------------------------------------------------
+_Use_decl_annotations_
 VOID
 NPF_registerLWF(
 	PNDIS_FILTER_DRIVER_CHARACTERISTICS pFChars,
@@ -566,6 +595,7 @@ NPF_registerLWF(
 
 
 //-------------------------------------------------------------------
+_Use_decl_annotations_
 ULONG
 NPF_GetRegistryOption_Integer(
 	PUNICODE_STRING RegistryPath,
@@ -657,6 +687,7 @@ REGISTRY_QUERY_VALUE_KEY:
 }
 
 //-------------------------------------------------------------------
+_Use_decl_annotations_
 VOID
 NPF_GetRegistryOption_String(
 	PUNICODE_STRING RegistryPath,
@@ -1565,7 +1596,7 @@ NPF_IoControl(
 		TRACE_MESSAGE3(PACKET_DEBUG_LOUD, "%s Request: Oid=%08lx, Length=%08lx", FunctionCode == BIOCQUERYOID ? "BIOCQUERYOID" : "BIOCSETOID", OidData->Oid, OidData->Length);
 
 		// Extract a request from the list of free ones
-		pRequest = NPF_POOL_GET(Open->pFiltMod->InternalRequestPool, PINTERNAL_REQUEST);
+		pRequest = (PINTERNAL_REQUEST) NPF_ObjectPoolGet(Open->pFiltMod->InternalRequestPool);
 		if (pRequest == NULL)
 		{
 			TRACE_MESSAGE(PACKET_DEBUG_LOUD, "pRequest=NULL");
@@ -1838,7 +1869,7 @@ NPF_IoControl(
 
 OID_REQUEST_DONE:
 
-		NPF_POOL_RETURN(Open->pFiltMod->InternalRequestPool, pRequest, NULL);
+		NPF_ObjectPoolReturn(Open->pFiltMod->InternalRequestPool, pRequest, NULL);
 
 		break;
 
