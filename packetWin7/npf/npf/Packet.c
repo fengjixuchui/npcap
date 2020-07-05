@@ -82,12 +82,8 @@
 
 #include "stdafx.h"
 
-#include <ntddk.h>
-#include <ndis.h>
-
 #include "Loopback.h"
 #include "Lo_send.h"
-#include "debug.h"
 #include "packet.h"
 #include "win_bpf.h"
 #include "ioctls.h"
@@ -450,6 +446,84 @@ DriverEntry(
 		TRACE_MESSAGE2(PACKET_DEBUG_LOUD, "NdisFRegisterFilterDriver: succeed to register filter with NDIS, Status = %x, FilterDriverHandle = %p", Status, FilterDriverHandle);
 	}
 
+	devExtP->FilterDriverHandle = FilterDriverHandle;
+	InitializeListHead(&devExtP->AllOpens);
+	devExtP->AllOpensLock = NdisAllocateRWLock(FilterDriverHandle);
+	if (devExtP->AllOpensLock == NULL)
+	{
+		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "Failed to allocate AllOpensLock");
+
+		NdisFDeregisterFilterDriver(FilterDriverHandle);
+		IoDeleteSymbolicLink(&deviceSymLink);
+		IoDeleteDevice(devObjP);
+		ExFreePool(deviceSymLink.Buffer);
+		devExtP->ExportString = NULL;
+
+		TRACE_EXIT();
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+
+	devExtP->NBLCopyPool = NPF_AllocateObjectPool(FilterDriverHandle, sizeof(NPF_NBL_COPY), 256);
+	if (devExtP->NBLCopyPool == NULL)
+	{
+		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "Failed to allocate NBLCopyPool");
+
+		NdisFreeRWLock(devExtP->AllOpensLock);
+		NdisFDeregisterFilterDriver(FilterDriverHandle);
+		IoDeleteSymbolicLink(&deviceSymLink);
+		IoDeleteDevice(devObjP);
+		ExFreePool(deviceSymLink.Buffer);
+		devExtP->ExportString = NULL;
+
+		TRACE_EXIT();
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+
+	devExtP->NBCopiesPool = NPF_AllocateObjectPool(FilterDriverHandle, sizeof(NPF_NB_COPIES), 256);
+	if (devExtP->NBCopiesPool == NULL)
+	{
+		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "Failed to allocate NBCopiesPool");
+
+		NPF_FreeObjectPool(devExtP->NBLCopyPool);
+		NdisFreeRWLock(devExtP->AllOpensLock);
+		NdisFDeregisterFilterDriver(FilterDriverHandle);
+		IoDeleteSymbolicLink(&deviceSymLink);
+		IoDeleteDevice(devObjP);
+		ExFreePool(deviceSymLink.Buffer);
+		devExtP->ExportString = NULL;
+
+		TRACE_EXIT();
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+
+#ifdef HAVE_DOT11_SUPPORT
+	if (g_Dot11SupportMode)
+	{
+		devExtP->Dot11HeaderPool = NPF_AllocateObjectPool(FilterDriverHandle, sizeof(NPF_NB_COPIES), 256);
+		if (devExtP->Dot11HeaderPool == NULL)
+		{
+			TRACE_MESSAGE(PACKET_DEBUG_LOUD, "Failed to allocate Dot11HeaderPool");
+
+			NPF_FreeObjectPool(devExtP->NBCopiesPool);
+			NPF_FreeObjectPool(devExtP->NBLCopyPool);
+			NdisFreeRWLock(devExtP->AllOpensLock);
+			NdisFDeregisterFilterDriver(FilterDriverHandle);
+			IoDeleteSymbolicLink(&deviceSymLink);
+			IoDeleteDevice(devObjP);
+			ExFreePool(deviceSymLink.Buffer);
+			devExtP->ExportString = NULL;
+
+			TRACE_EXIT();
+			return STATUS_INSUFFICIENT_RESOURCES;
+		}
+	}
+	else
+	{
+		devExtP->Dot11HeaderPool = NULL;
+	}
+#endif
+
+
 #ifdef HAVE_WFP_LOOPBACK_SUPPORT
 	if (g_LoopbackSupportMode) {
 		do {
@@ -537,13 +611,15 @@ NPF_registerLWF(
 	NdisZeroMemory(pFChars, sizeof(NDIS_FILTER_DRIVER_CHARACTERISTICS));
 	pFChars->Header.Type = NDIS_OBJECT_TYPE_FILTER_DRIVER_CHARACTERISTICS;
 	pFChars->Header.Size = sizeof(NDIS_FILTER_DRIVER_CHARACTERISTICS);
-#if NDIS_SUPPORT_NDIS61
+#if NDIS_SUPPORT_NDIS680
+	pFChars->Header.Revision = NDIS_FILTER_CHARACTERISTICS_REVISION_3;
+#elif NDIS_SUPPORT_NDIS61
 	pFChars->Header.Revision = NDIS_FILTER_CHARACTERISTICS_REVISION_2;
 #else
 	pFChars->Header.Revision = NDIS_FILTER_CHARACTERISTICS_REVISION_1;
 #endif
 
-	pFChars->MajorNdisVersion = NDIS_FILTER_MAJOR_VERSION; // NDIS version is 6.2 (Windows 7)
+	pFChars->MajorNdisVersion = NDIS_FILTER_MAJOR_VERSION;
 	pFChars->MinorNdisVersion = NDIS_FILTER_MINOR_VERSION;
 	pFChars->MajorDriverVersion = WINPCAP_MINOR;
 	/* TODO: Stop using minor version numbers greater than 255 */
@@ -582,6 +658,17 @@ NPF_registerLWF(
 	pFChars->NetPnPEventHandler = NPF_NetPnPEvent;
 	pFChars->StatusHandler = NPF_Status;
 	pFChars->CancelSendNetBufferListsHandler = NPF_CancelSendNetBufferLists;
+
+#if NDIS_SUPPORT_NDIS61
+	pFChars->DirectOidRequestHandler = NULL;
+	pFChars->DirectOidRequestCompleteHandler = NULL;
+	pFChars->CancelDirectOidRequestHandler = NULL;
+#endif
+
+#if NDIS_SUPPORT_NDIS680
+	pFChars->SynchronousOidRequestHandler = NULL;
+	pFChars->SynchronousOidRequestCompleteHandler = NULL;
+#endif
 }
 
 //-------------------------------------------------------------------
@@ -872,6 +959,24 @@ Return Value:
 			DeviceExtension->ExportString = NULL;
 		}
 
+		if (DeviceExtension->NBLCopyPool)
+		{
+			NPF_FreeObjectPool(DeviceExtension->NBLCopyPool);
+		}
+
+		if (DeviceExtension->NBCopiesPool)
+		{
+			NPF_FreeObjectPool(DeviceExtension->NBCopiesPool);
+		}
+
+#ifdef HAVE_DOT11_SUPPORT
+		if (DeviceExtension->Dot11HeaderPool)
+		{
+			NPF_FreeObjectPool(DeviceExtension->Dot11HeaderPool);
+		}
+#endif
+
+		NdisFreeRWLock(DeviceExtension->AllOpensLock);
 		IoDeleteDevice(OldDeviceObject);
 	}
 
@@ -928,6 +1033,11 @@ Return Value:
 	Status = STATUS_SUCCESS;	\
 } while(FALSE)
 
+#define SET_FAILURE_BUFFER(__len__) do {\
+	Information = __len__; \
+	Status = STATUS_BUFFER_TOO_SMALL; \
+} while(FALSE)
+
 #define SET_FAILURE(__STATUS_CODE) do{\
 	Information = 0; \
 	Status = __STATUS_CODE; \
@@ -956,7 +1066,8 @@ NPF_IoControl(
 	ULONG					FunctionCode;
 	NDIS_STATUS				Status = STATUS_INVALID_DEVICE_REQUEST;
 	ULONG					Information = 0;
-	PLIST_ENTRY				PacketListEntry;
+	PLIST_ENTRY				CurrEntry;
+	PULONG pUL;
 	UINT					i;
 	PUCHAR					tpointer = NULL; //assign NULL to suppress error C4703: potentially uninitialized local pointer variable
 	ULONG					dim, timeout;
@@ -980,6 +1091,7 @@ NPF_IoControl(
 	PUINT					pStats;
 	ULONG					StatsLength;
 	PULONG					pCombinedPacketFilter;
+	PNDIS_LINK_STATE pLinkState;
 
 	HANDLE					hUserEvent;
 	PKEVENT					pKernelEvent;
@@ -1047,6 +1159,14 @@ NPF_IoControl(
 		return Status;
 	}
 
+#define FAIL_IF_BUFFER_SMALL(__size__) \
+	if (Irp->AssociatedIrp.SystemBuffer == NULL || \
+		IrpSp->Parameters.DeviceIoControl.OutputBufferLength < __size__) \
+	{ \
+		SET_FAILURE_BUFFER(__size__); \
+		break; \
+	}
+
 	switch (FunctionCode)
 	{
 	case BIOCGSTATS:
@@ -1055,17 +1175,7 @@ NPF_IoControl(
 		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "BIOCGSTATS");
 
 		StatsLength = 4 * sizeof(UINT);
-		if (IrpSp->Parameters.DeviceIoControl.OutputBufferLength < StatsLength)
-		{
-			SET_FAILURE(STATUS_BUFFER_TOO_SMALL);
-			break;
-		}
-
-		if (Irp->AssociatedIrp.SystemBuffer == NULL)
-		{
-			SET_FAILURE(STATUS_UNSUCCESSFUL);
-			break;
-		}
+		FAIL_IF_BUFFER_SMALL(StatsLength);
 
 		//
 		// temp fix to a GIANT bug from LD. The CTL code has been defined as METHOD_NEITHER, so it
@@ -1144,16 +1254,11 @@ NPF_IoControl(
 	case BIOCSETF:
 		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "BIOCSETF");
 
+		FAIL_IF_BUFFER_SMALL(sizeof(struct bpf_insn));
 		//
 		// Get the pointer to the new program
 		//
 		NewBpfProgram = (struct bpf_insn *)Irp->AssociatedIrp.SystemBuffer;
-
-		if (NewBpfProgram == NULL)
-		{
-			SET_FAILURE(STATUS_BUFFER_TOO_SMALL);
-			break;
-		}
 
 		// Lock the BPF engine for writing. 
 		NdisAcquireRWLockWrite(Open->MachineLock, &lockState, 0);
@@ -1234,11 +1339,7 @@ NPF_IoControl(
 
 		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "BIOCSMODE");
 
-		if (IrpSp->Parameters.DeviceIoControl.InputBufferLength < sizeof(ULONG))
-		{
-			SET_FAILURE(STATUS_BUFFER_TOO_SMALL);
-			break;
-		}
+		FAIL_IF_BUFFER_SMALL(sizeof(ULONG));
 
 		mode = *((PULONG)Irp->AssociatedIrp.SystemBuffer);
 
@@ -1397,11 +1498,7 @@ NPF_IoControl(
 		break;
 
 	case BIOCISETLOBBEH:
-		if (IrpSp->Parameters.DeviceIoControl.InputBufferLength < sizeof(INT))
-		{
-			SET_FAILURE(STATUS_BUFFER_TOO_SMALL);
-			break;
-		}
+		FAIL_IF_BUFFER_SMALL(sizeof(INT));
 
 		if (*(PINT) Irp->AssociatedIrp.SystemBuffer == NPF_DISABLE_LOOPBACK)
 		{
@@ -1493,11 +1590,7 @@ NPF_IoControl(
 	case BIOCSETBUFFERSIZE:
 		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "BIOCSETBUFFERSIZE");
 
-		if (IrpSp->Parameters.DeviceIoControl.InputBufferLength < sizeof(ULONG))
-		{
-			SET_FAILURE(STATUS_BUFFER_TOO_SMALL);
-			break;
-		}
+		FAIL_IF_BUFFER_SMALL(sizeof(ULONG));
 
 		// Get the number of bytes to allocate
 		dim = *((PULONG)Irp->AssociatedIrp.SystemBuffer);
@@ -1533,11 +1626,7 @@ NPF_IoControl(
 
 		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "BIOCSRTIMEOUT");
 
-		if (IrpSp->Parameters.DeviceIoControl.InputBufferLength < sizeof(ULONG))
-		{
-			SET_FAILURE(STATUS_BUFFER_TOO_SMALL);
-			break;
-		}
+		FAIL_IF_BUFFER_SMALL(sizeof(ULONG));
 
 		timeout = *((PULONG)Irp->AssociatedIrp.SystemBuffer);
 		if (timeout == (ULONG) - 1)
@@ -1560,11 +1649,7 @@ NPF_IoControl(
 
 		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "BIOCSWRITEREP");
 
-		if (IrpSp->Parameters.DeviceIoControl.InputBufferLength < sizeof(ULONG))
-		{
-			SET_FAILURE(STATUS_BUFFER_TOO_SMALL);
-			break;
-		}
+		FAIL_IF_BUFFER_SMALL(sizeof(ULONG));
 
 		Open->Nwrites = *((PULONG)Irp->AssociatedIrp.SystemBuffer);
 
@@ -1578,11 +1663,7 @@ NPF_IoControl(
 
 		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "BIOCSMINTOCOPY");
 
-		if (IrpSp->Parameters.DeviceIoControl.InputBufferLength < sizeof(ULONG))
-		{
-			SET_FAILURE(STATUS_BUFFER_TOO_SMALL);
-			break;
-		}
+		FAIL_IF_BUFFER_SMALL(sizeof(ULONG));
 
 		Open->MinToCopy = *((PULONG)Irp->AssociatedIrp.SystemBuffer);
 
@@ -1635,8 +1716,8 @@ NPF_IoControl(
 						case OID_GEN_MAXIMUM_TOTAL_SIZE:
 						case OID_GEN_TRANSMIT_BUFFER_SPACE:
 						case OID_GEN_RECEIVE_BUFFER_SPACE:
-							TRACE_MESSAGE2(PACKET_DEBUG_LOUD, "Loopback: AdapterName=%ws, OID_GEN_MAXIMUM_TOTAL_SIZE & BIOCGETOID, OidData->Data = %d", Open->pFiltMod->AdapterName.Buffer, NPF_LOOPBACK_INTERFACR_MTU + ETHER_HDR_LEN);
-							*((PUINT)OidData->Data) = NPF_LOOPBACK_INTERFACR_MTU + ETHER_HDR_LEN;
+							TRACE_MESSAGE2(PACKET_DEBUG_LOUD, "Loopback: AdapterName=%ws, OID_GEN_MAXIMUM_TOTAL_SIZE & BIOCGETOID, OidData->Data = %d", Open->pFiltMod->AdapterName.Buffer, Open->pFiltMod->MaxFrameSize);
+							*((PUINT)OidData->Data) = Open->pFiltMod->MaxFrameSize;
 							SET_RESULT_SUCCESS(sizeof(PACKET_OID_DATA) - 1 + OidData->Length);
 							break;
 
@@ -1653,6 +1734,21 @@ NPF_IoControl(
 							OidData->Length = sizeof(UINT);
 							SET_RESULT_SUCCESS(sizeof(PACKET_OID_DATA) - 1 + OidData->Length);
 							break;
+						case OID_GEN_LINK_STATE:
+							if (OidData->Length < sizeof(NDIS_LINK_STATE))
+							{
+								SET_FAILURE_BUFFER(sizeof(NDIS_LINK_STATE));
+							}
+							else
+							{
+								pLinkState = (PNDIS_LINK_STATE) OidData->Data;
+								pLinkState->MediaConnectState = MediaConnectStateConnected;
+								pLinkState->MediaDuplexState = MediaDuplexStateFull;
+								pLinkState->XmitLinkSpeed = NDIS_LINK_SPEED_UNKNOWN;
+								pLinkState->RcvLinkSpeed = NDIS_LINK_SPEED_UNKNOWN;
+								pLinkState->PauseFunctions = NdisPauseFunctionsUnsupported;
+								SET_RESULT_SUCCESS(sizeof(PACKET_OID_DATA) - 1 + OidData->Length);
+							}
 						default:
 							TRACE_MESSAGE(PACKET_DEBUG_LOUD, "Unsupported BIOCQUERYOID for Loopback");
 							SET_FAILURE(STATUS_INVALID_DEVICE_REQUEST);
@@ -1869,16 +1965,12 @@ NPF_IoControl(
 
 OID_REQUEST_DONE:
 
-		NPF_ObjectPoolReturn(Open->pFiltMod->InternalRequestPool, pRequest, NULL);
+		NPF_ObjectPoolReturn(pRequest, NULL);
 
 		break;
 
 	case BIOCSTIMESTAMPMODE:
-		if (IrpSp->Parameters.DeviceIoControl.InputBufferLength < sizeof(ULONG))
-		{
-			SET_FAILURE(STATUS_BUFFER_TOO_SMALL);
-			break;
-		}
+		FAIL_IF_BUFFER_SMALL(sizeof(ULONG));
 
 		dim = *((PULONG)Irp->AssociatedIrp.SystemBuffer);
 		
@@ -1894,6 +1986,34 @@ OID_REQUEST_DONE:
 		Open->TimestampMode = dim;
 
 		SET_RESULT_SUCCESS(0);
+		break;
+
+	case BIOCGETPIDS:
+		// Need to at least deliver the number of PIDS
+		FAIL_IF_BUFFER_SMALL(sizeof(ULONG));
+
+		dim = IrpSp->Parameters.DeviceIoControl.OutputBufferLength / sizeof(ULONG);
+		cnt = 0;
+		pUL = (PULONG)Irp->AssociatedIrp.SystemBuffer;
+
+		NdisAcquireRWLockRead(Open->DeviceExtension->AllOpensLock, &lockState, 0);
+
+		for (CurrEntry = Open->DeviceExtension->AllOpens.Flink;
+				CurrEntry != &Open->DeviceExtension->AllOpens;
+				CurrEntry = CurrEntry->Flink)
+		{
+			POPEN_INSTANCE pOpen = CONTAINING_RECORD(CurrEntry, OPEN_INSTANCE, AllOpensEntry);
+			cnt++;
+			if (cnt < dim)
+			{
+				pUL[cnt] = pOpen->UserPID;
+			}
+		}
+		NdisReleaseRWLock(Open->DeviceExtension->AllOpensLock, &lockState);
+
+		*pUL = cnt;
+		Information = sizeof(ULONG) * (cnt+1);
+		Status = (cnt < dim) ? STATUS_SUCCESS : STATUS_BUFFER_OVERFLOW;
 		break;
 
 	default:

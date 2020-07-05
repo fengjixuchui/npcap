@@ -64,13 +64,19 @@ _Ret_maybenull_
 PNPF_OBJ_POOL NPF_AllocateObjectPool(
 	_In_ NDIS_HANDLE NdisHandle,
 	_In_ ULONG ulObjectSize,
-	_In_ ULONG ulIncrement);
+	_In_ USHORT ulIncrement);
 
 /* Frees an object pool and all associated memory.
  * All objects obtained from the pool are invalid.
  * param pPool A pointer to the pool obtained via NPF_AllocateObjectPool
  */
 VOID NPF_FreeObjectPool(
+	_In_ PNPF_OBJ_POOL pPool);
+
+/* Shrinks an object pool by freeing any empty shelves (slabs) provided there
+ * are enough unused slots in the existing partial slabs.
+ */
+VOID NPF_ShrinkObjectPool(
 	_In_ PNPF_OBJ_POOL pPool);
 
 /* Retrieve an object from the pool. The object is uninitialized and pointed to
@@ -85,13 +91,12 @@ typedef VOID (*PNPF_OBJ_CLEANUP)(
 	_In_ PVOID pObject);
 
 /* Return an object to the pool. Decrements the refcount. If it is 0, the
- * object is returned to the pool.
- * param pPool A pointer to the pool obtained via NPF_AllocateObjectPool
+ * object is returned to the pool. The pool is identified by the location of
+ * the object's memory.
  * param pObject A pointer to an object to return
  * param CleanupFunc Optional function to perform cleanup of the object before returning it (free referenced memory, e.g.). Use NULL if no such function is needed.
  */
 VOID NPF_ObjectPoolReturn(
-	_In_ PNPF_OBJ_POOL pPool,
 	_In_ PVOID pObject,
 	_In_opt_ PNPF_OBJ_CLEANUP CleanupFunc);
 

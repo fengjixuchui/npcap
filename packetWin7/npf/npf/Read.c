@@ -82,10 +82,6 @@
 
 #include "stdafx.h"
 
-#include <ntddk.h>
-#include <ndis.h>
-
-#include "debug.h"
 #include "packet.h"
 #include "win_bpf.h"
 #include "time_calls.h"
@@ -364,7 +360,7 @@ NPF_Read(
 		InterlockedExchangeAdd(&Open->Free, NPF_CAP_SIZE(pCapData, pRadiotapHeader));
 
 		// Return this capture data
-		NPF_ObjectPoolReturn(Open->CapturePool, pCapData, NPF_FreeCapData);
+		NPF_ObjectPoolReturn(pCapData, NPF_FreeCapData);
 
 		ASSERT(Open->Free <= Open->Size);
 	}
@@ -436,7 +432,7 @@ NPF_DoTap(
 	for (Curr = NBLCopiesHead.Next; Curr != NULL; Curr = Curr->Next)
 	{
 		pNBLCopy = CONTAINING_RECORD(Curr, NPF_NBL_COPY, NBLCopyEntry); 
-		NPF_ObjectPoolReturn(pFiltMod->NBLCopyPool, pNBLCopy, NPF_FreeNBLCopy);
+		NPF_ObjectPoolReturn(pNBLCopy, NPF_FreeNBLCopy);
 	}
 
 	return;
@@ -599,7 +595,7 @@ NPF_TapExForEachOpen(
 		if (pNBLCopyPrev->Next == NULL)
 		{
 			// Add another NBL copy to the chain
-			pNBLCopy = (PNPF_NBL_COPY) NPF_ObjectPoolGet(Open->pFiltMod->NBLCopyPool);
+			pNBLCopy = (PNPF_NBL_COPY) NPF_ObjectPoolGet(Open->DeviceExtension->NBLCopyPool);
 			if (pNBLCopy == NULL)
 			{
 				//Insufficient resources.
@@ -608,7 +604,6 @@ NPF_TapExForEachOpen(
 				goto TEFEO_done_with_NBs;
 			}
 			RtlZeroMemory(pNBLCopy, sizeof(NPF_NBL_COPY));
-			pNBLCopy->pFiltMod = Open->pFiltMod;
 			pNBLCopyPrev->Next = &pNBLCopy->NBLCopyEntry;
 		}
 		else
@@ -658,7 +653,7 @@ NPF_TapExForEachOpen(
 					goto RadiotapDone;
 				}
 
-				pNBLCopy->Dot11RadiotapHeader = (PUCHAR) NPF_ObjectPoolGet(Open->pFiltMod->Dot11HeaderPool);
+				pNBLCopy->Dot11RadiotapHeader = (PUCHAR) NPF_ObjectPoolGet(Open->DeviceExtension->Dot11HeaderPool);
 				if (pNBLCopy->Dot11RadiotapHeader == NULL)
 				{
 					// Insufficient memory
@@ -822,7 +817,7 @@ NPF_TapExForEachOpen(
 			if (pNBCopiesPrev->Next == NULL)
 			{
 				// Add another copy to the chain
-				pNBCopy = (PNPF_NB_COPIES) NPF_ObjectPoolGet(Open->pFiltMod->NBCopiesPool);
+				pNBCopy = (PNPF_NB_COPIES) NPF_ObjectPoolGet(Open->DeviceExtension->NBCopiesPool);
 				if (pNBCopy == NULL)
 				{
 					//Insufficient resources.

@@ -252,7 +252,16 @@ typedef struct _DEVICE_EXTENSION
 										///< to open this adapter through Packet.dll.
 	SINGLE_LIST_ENTRY DetachedOpens; //GroupHead
 	KSPIN_LOCK DetachedOpensLock; // GroupLock
+	LIST_ENTRY AllOpens;
+	PNDIS_RW_LOCK_EX AllOpensLock;
+	NDIS_HANDLE FilterDriverHandle;
 	PDEVICE_OBJECT pDevObj; // pointer to the DEVICE_OBJECT for this device
+
+	PNPF_OBJ_POOL NBLCopyPool; // Pool of NPF_NBL_COPY objects
+	PNPF_OBJ_POOL NBCopiesPool; // Pool of NPF_NB_COPIES objects
+#ifdef HAVE_DOT11_SUPPORT
+	PNPF_OBJ_POOL Dot11HeaderPool; // Pool of Radiotap header buffers
+#endif
 } DEVICE_EXTENSION, *PDEVICE_EXTENSION;
 
 typedef enum _FILTER_STATE
@@ -296,9 +305,6 @@ typedef struct _NPCAP_FILTER_MODULE
 	SINGLE_LIST_ENTRY OpenInstances; //GroupHead
 	PNDIS_RW_LOCK_EX OpenInstancesLock; // GroupLock
 
-	PNPF_OBJ_POOL NBLCopyPool; // Pool of NPF_NBL_COPY objects
-	PNPF_OBJ_POOL NBCopiesPool; // Pool of NPF_NB_COPIES objects
-
 	NDIS_STRING				AdapterName;
 #ifdef HAVE_WFP_LOOPBACK_SUPPORT
 	BOOLEAN					Loopback;
@@ -310,7 +316,6 @@ typedef struct _NPCAP_FILTER_MODULE
 #ifdef HAVE_DOT11_SUPPORT
 	BOOLEAN					HasDataRateMappingTable;
 	DOT11_DATA_RATE_MAPPING_TABLE	DataRateMappingTable;
-	PNPF_OBJ_POOL Dot11HeaderPool; // Pool of Radiotap header buffers
 #endif
 
 	ULONG					MyPacketFilter;
@@ -345,6 +350,7 @@ typedef struct _OPEN_INSTANCE
 {
 	ULONG OpenSignature;
     SINGLE_LIST_ENTRY OpenInstancesEntry; //GroupNext
+    LIST_ENTRY AllOpensEntry;
     PNPCAP_FILTER_MODULE pFiltMod;
 
 	PDEVICE_EXTENSION DeviceExtension;
@@ -417,8 +423,8 @@ typedef struct _OPEN_INSTANCE
 	NDIS_SPIN_LOCK			OpenInUseLock;
 	ULONG TimestampMode;
 	struct timeval start; // Time synchronization of QPC with last boot
-
-} 
+	ULONG UserPID; // A PID associated with this handle
+}
 OPEN_INSTANCE, *POPEN_INSTANCE;
 
 typedef enum
@@ -442,7 +448,6 @@ typedef struct _NPF_NBL_COPY
 {
 	SINGLE_LIST_ENTRY NBCopiesHead;
 	SINGLE_LIST_ENTRY NBLCopyEntry;
-	PNPCAP_FILTER_MODULE pFiltMod;
 #ifdef HAVE_DOT11_SUPPORT
 	PUCHAR Dot11RadiotapHeader;
 #endif

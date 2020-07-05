@@ -82,10 +82,6 @@
 
 #include "stdafx.h"
 
-#include <ntddk.h>
-#include <ndis.h>
-
-#include "debug.h"
 #include "packet.h"
 #include "Loopback.h"
 #include "Lo_send.h"
@@ -405,7 +401,7 @@ NPF_ResetBufferContents(
 	for (Curr = Open->PacketQueue.Flink; Curr != &Open->PacketQueue; Curr = Curr->Flink)
 	{
 		pCapData = CONTAINING_RECORD(Curr, NPF_CAP_DATA, PacketQueueEntry);
-		NPF_ObjectPoolReturn(Open->CapturePool, pCapData, NPF_FreeCapData);
+		NPF_ObjectPoolReturn(pCapData, NPF_FreeCapData);
 	}
 	// Remove links
 	InitializeListHead(&Open->PacketQueue);
@@ -418,7 +414,6 @@ NPF_ResetBufferContents(
 _Use_decl_annotations_
 VOID NPF_FreeNBCopies(PNPF_NB_COPIES pNBCopy)
 {
-	PNPCAP_FILTER_MODULE pFiltMod = pNBCopy->pNBLCopy->pFiltMod;
 	PVOID pDeleteMe = NULL;
 	PMDL pMdl = NULL;
 	ULONG ulSize = 0;
@@ -454,9 +449,6 @@ VOID NPF_FreeNBLCopy(PNPF_NBL_COPY pNBLCopy)
 {
 	PNPF_NB_COPIES pNBCopies = NULL;
 	PSINGLE_LIST_ENTRY pNBCopiesEntry = NULL;
-	PNPCAP_FILTER_MODULE pFiltMod = NULL;
-
-	pFiltMod = pNBLCopy->pFiltMod;
 
 	pNBCopiesEntry = pNBLCopy->NBCopiesHead.Next;
 	while (pNBCopiesEntry != NULL)
@@ -464,24 +456,63 @@ VOID NPF_FreeNBLCopy(PNPF_NBL_COPY pNBLCopy)
 		pNBCopies = CONTAINING_RECORD(pNBCopiesEntry, NPF_NB_COPIES, CopiesEntry);
 		pNBCopiesEntry = pNBCopiesEntry->Next;
 
-		NPF_ObjectPoolReturn(pFiltMod->NBCopiesPool, pNBCopies, NPF_FreeNBCopies);
+		NPF_ObjectPoolReturn(pNBCopies, NPF_FreeNBCopies);
 	}
 
 	if (pNBLCopy->Dot11RadiotapHeader != NULL)
 	{
-		NPF_ObjectPoolReturn(pFiltMod->Dot11HeaderPool, pNBLCopy->Dot11RadiotapHeader, NULL);
+		NPF_ObjectPoolReturn(pNBLCopy->Dot11RadiotapHeader, NULL);
 	}
 }
 
 _Use_decl_annotations_
 VOID NPF_FreeCapData(PNPF_CAP_DATA pCapData)
 {
-	PNPCAP_FILTER_MODULE pFiltMod = pCapData->pNBCopy->pNBLCopy->pFiltMod;
-	NPF_ObjectPoolReturn(pFiltMod->NBLCopyPool, pCapData->pNBCopy->pNBLCopy, NPF_FreeNBLCopy);
-	NPF_ObjectPoolReturn(pFiltMod->NBCopiesPool, pCapData->pNBCopy, NPF_FreeNBCopies);
+	NPF_ObjectPoolReturn(pCapData->pNBCopy->pNBLCopy, NPF_FreeNBLCopy);
+	NPF_ObjectPoolReturn(pCapData->pNBCopy, NPF_FreeNBCopies);
 }
 
+VOID
+NPF_ShrinkPools(_In_ PDEVICE_EXTENSION pDevExt)
+{
+	if (pDevExt->NBLCopyPool)
+	{
+		NPF_ShrinkObjectPool(pDevExt->NBLCopyPool);
+	}
+	if (pDevExt->NBCopiesPool)
+	{
+		NPF_ShrinkObjectPool(pDevExt->NBCopiesPool);
+	}
+#ifdef HAVE_DOT11_SUPPORT
+	if (pDevExt->Dot11HeaderPool)
+	{
+		NPF_ShrinkObjectPool(pDevExt->Dot11HeaderPool);
+	}
+#endif
+}
 //-------------------------------------------------------------------
+
+VOID
+NPF_AddToAllOpensList(_In_ POPEN_INSTANCE pOpen)
+{
+	LOCK_STATE_EX lockState;
+	PDEVICE_EXTENSION pDevExt = pOpen->DeviceExtension;
+
+	NdisAcquireRWLockWrite(pDevExt->AllOpensLock, &lockState, 0);
+	InsertTailList(&pDevExt->AllOpens, &pOpen->AllOpensEntry);
+	NdisReleaseRWLock(pDevExt->AllOpensLock, &lockState);
+}
+
+VOID
+NPF_RemoveFromAllOpensList(_In_ POPEN_INSTANCE pOpen)
+{
+	LOCK_STATE_EX lockState;
+	PDEVICE_EXTENSION pDevExt = pOpen->DeviceExtension;
+
+	NdisAcquireRWLockWrite(pDevExt->AllOpensLock, &lockState, 0);
+	RemoveEntryList(&pOpen->AllOpensEntry);
+	NdisReleaseRWLock(pDevExt->AllOpensLock, &lockState);
+}
 
 _Use_decl_annotations_
 NTSTATUS
@@ -490,53 +521,69 @@ NPF_OpenAdapter(
 	PIRP Irp
 	)
 {
-	PNPCAP_FILTER_MODULE			pFiltMod;
+	PNPCAP_FILTER_MODULE			pFiltMod = NULL;
 	POPEN_INSTANCE			Open;
 	PIO_STACK_LOCATION		IrpSp;
 	NDIS_STATUS				Status = STATUS_SUCCESS;
-	ULONG					localNumOpenedInstances;
+	ULONG idx;
+	PUNICODE_STRING FileName;
+	NDIS_HANDLE NdisFilterHandle = ((PDEVICE_EXTENSION)(DeviceObject->DeviceExtension))->FilterDriverHandle;
 
 	TRACE_ENTER();
 
 	IrpSp = IoGetCurrentIrpStackLocation(Irp);
-	// Find the head adapter of the global array.
-	pFiltMod = NPF_GetFilterModuleByAdapterName(&IrpSp->FileObject->FileName);
 
-	if (pFiltMod == NULL)
+	FileName = &IrpSp->FileObject->FileName;
+	// Skip leading slashes
+	for (idx = 0; idx < FileName->Length && FileName->Buffer[idx] == L'\\'; idx++);
+	// If the filename is empty or all slashes, this is a request for the "root" device.
+	// Otherwise, look for a filter module for it.
+	if (idx != FileName->Length)
 	{
-		// Can't find the adapter from the global open array.
-		TRACE_MESSAGE1(PACKET_DEBUG_LOUD,
-			"NPF_GetFilterModuleByAdapterName error, pFiltMod=NULL, AdapterName=%ws",
-			IrpSp->FileObject->FileName.Buffer);
+		// Find the head adapter of the global array.
+		pFiltMod = NPF_GetFilterModuleByAdapterName(&IrpSp->FileObject->FileName);
 
-		Irp->IoStatus.Status = STATUS_NDIS_INTERFACE_NOT_FOUND;
-		Irp->IoStatus.Information = FILE_DOES_NOT_EXIST;
-		IoCompleteRequest(Irp, IO_NO_INCREMENT);
-		TRACE_EXIT();
-		return STATUS_NDIS_INTERFACE_NOT_FOUND;
-	}
+		if (pFiltMod == NULL)
+		{
+			// Can't find the adapter from the global open array.
+			TRACE_MESSAGE1(PACKET_DEBUG_LOUD,
+				"NPF_GetFilterModuleByAdapterName error, pFiltMod=NULL, AdapterName=%ws",
+				IrpSp->FileObject->FileName.Buffer);
 
-	if (NPF_StartUsingBinding(pFiltMod) == FALSE)
-	{
-		TRACE_MESSAGE1(PACKET_DEBUG_LOUD,
-			"NPF_StartUsingBinding error, AdapterName=%ws",
-			IrpSp->FileObject->FileName.Buffer);
+			Irp->IoStatus.Status = STATUS_NDIS_INTERFACE_NOT_FOUND;
+			Irp->IoStatus.Information = FILE_DOES_NOT_EXIST;
+			IoCompleteRequest(Irp, IO_NO_INCREMENT);
+			TRACE_EXIT();
+			return STATUS_NDIS_INTERFACE_NOT_FOUND;
+		}
 
-		Irp->IoStatus.Status = STATUS_NDIS_OPEN_FAILED;
-		IoCompleteRequest(Irp, IO_NO_INCREMENT);
-		TRACE_EXIT();
-		return STATUS_NDIS_OPEN_FAILED;
+		if (NPF_StartUsingBinding(pFiltMod) == FALSE)
+		{
+			TRACE_MESSAGE1(PACKET_DEBUG_LOUD,
+				"NPF_StartUsingBinding error, AdapterName=%ws",
+				IrpSp->FileObject->FileName.Buffer);
+
+			Irp->IoStatus.Status = STATUS_NDIS_OPEN_FAILED;
+			IoCompleteRequest(Irp, IO_NO_INCREMENT);
+			TRACE_EXIT();
+			return STATUS_NDIS_OPEN_FAILED;
+		}
+
+		NdisFilterHandle = pFiltMod->AdapterHandle;
 	}
 
 	// Create a group child adapter object from the head adapter.
-	Open = NPF_CreateOpenObject(pFiltMod->AdapterHandle);
+	Open = NPF_CreateOpenObject(NdisFilterHandle);
 	if (Open == NULL)
 	{
+		if (pFiltMod)
+			NPF_StopUsingBinding(pFiltMod);
 		Irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
 		TRACE_EXIT();
 		return STATUS_INSUFFICIENT_RESOURCES;
 	}
+	Open->UserPID = IoGetRequestorProcessId(Irp);
 	Open->pFiltMod = pFiltMod;
 	Open->DeviceExtension = DeviceObject->DeviceExtension;
 
@@ -545,7 +592,7 @@ NPF_OpenAdapter(
 		"Opening the device %ws, BindingContext=%p, Loopback=%u",
 		IrpSp->FileObject->FileName.Buffer,
 		Open,
-		pFiltMod->Loopback);
+		pFiltMod ? pFiltMod->Loopback : 0);
 #else
 	TRACE_MESSAGE2(PACKET_DEBUG_LOUD,
 		"Opening the device %ws, BindingContext=%p, Loopback=<Not supported>",
@@ -575,14 +622,18 @@ NPF_OpenAdapter(
 		IrpSp->FileObject->FsContext = Open;
 	}
 
+	NPF_AddToAllOpensList(Open);
+
 	//
 	// complete the open
 	//
 	TRACE_MESSAGE1(PACKET_DEBUG_LOUD, "Open = %p\n", Open);
 
-	NPF_AddToGroupOpenArray(Open, pFiltMod);
-
-	NPF_StopUsingBinding(pFiltMod);
+	if (pFiltMod)
+	{
+		NPF_AddToGroupOpenArray(Open, pFiltMod);
+		NPF_StopUsingBinding(pFiltMod);
+	}
 
 	Irp->IoStatus.Status = Status;
 	Irp->IoStatus.Information = FILE_OPENED;
@@ -990,26 +1041,6 @@ NPF_ReleaseFilterModuleResources(
 		pFiltMod->InternalRequestPool = NULL;
 	}
 
-	if (pFiltMod->NBLCopyPool)
-	{
-		NPF_FreeObjectPool(pFiltMod->NBLCopyPool);
-		pFiltMod->NBLCopyPool = NULL;
-	}
-
-	if (pFiltMod->NBCopiesPool)
-	{
-		NPF_FreeObjectPool(pFiltMod->NBCopiesPool);
-		pFiltMod->NBCopiesPool = NULL;
-	}
-
-#ifdef HAVE_DOT11_SUPPORT
-	if (pFiltMod->Dot11HeaderPool)
-	{
-		NPF_FreeObjectPool(pFiltMod->Dot11HeaderPool);
-		pFiltMod->Dot11HeaderPool = NULL;
-	}
-#endif
-
 	// Release the adapter name
 	if (pFiltMod->AdapterName.Buffer)
 	{
@@ -1028,7 +1059,6 @@ NPF_ReleaseFilterModuleResources(
 
 //-------------------------------------------------------------------
 
-/* Not currently used, but see npcap issue #186 */
 _Use_decl_annotations_
 NTSTATUS
 NPF_GetDeviceMTU(
@@ -1501,6 +1531,10 @@ NPF_Cleanup(
 	// release all the resources
 	//
 	NPF_ReleaseOpenInstanceResources(Open);
+	NPF_RemoveFromAllOpensList(Open);
+
+	// Shrink object pools if possible
+	NPF_ShrinkPools(Open->DeviceExtension);
 
 	//	IrpSp->FileObject->FsContext = NULL;
 
@@ -2040,6 +2074,7 @@ NPF_CreateFilterModule(
 
 	RtlZeroMemory(pFiltMod, sizeof(NPCAP_FILTER_MODULE));
 
+	pFiltMod->AdapterHandle = NdisFilterHandle;
 	pFiltMod->AdapterBindingStatus = FilterAttaching;
 #ifdef HAVE_WFP_LOOPBACK_SUPPORT
 	pFiltMod->Loopback = FALSE;
@@ -2112,43 +2147,9 @@ NPF_CreateFilterModule(
 			bAllocFailed = TRUE;
 			break;
 		}
-
-		pFiltMod->NBLCopyPool = NPF_AllocateObjectPool(NdisFilterHandle, sizeof(NPF_NBL_COPY), 64);
-		if (pFiltMod->NBLCopyPool == NULL)
-		{
-			TRACE_MESSAGE(PACKET_DEBUG_LOUD, "Failed to allocate NBLCopyPool");
-			bAllocFailed = TRUE;
-			break;
-		}
-
-		pFiltMod->NBCopiesPool = NPF_AllocateObjectPool(NdisFilterHandle, sizeof(NPF_NB_COPIES), 64);
-		if (pFiltMod->NBCopiesPool == NULL)
-		{
-			TRACE_MESSAGE(PACKET_DEBUG_LOUD, "Failed to allocate NBCopiesPool");
-			bAllocFailed = TRUE;
-			break;
-		}
-
-#ifdef HAVE_DOT11_SUPPORT
-		pFiltMod->Dot11HeaderPool = NPF_AllocateObjectPool(NdisFilterHandle, SIZEOF_RADIOTAP_BUFFER, 32);
-		if (pFiltMod->Dot11HeaderPool == NULL)
-		{
-			TRACE_MESSAGE(PACKET_DEBUG_LOUD, "Failed to allocate Dot11HeaderPool");
-			bAllocFailed = TRUE;
-			break;
-		}
-#endif
 	} while (0);
 
 	if (bAllocFailed) {
-#ifdef HAVE_DOT11_SUPPORT
-		if (pFiltMod->Dot11HeaderPool)
-			NPF_FreeObjectPool(pFiltMod->Dot11HeaderPool);
-#endif
-		if (pFiltMod->NBCopiesPool)
-			NPF_FreeObjectPool(pFiltMod->NBCopiesPool);
-		if (pFiltMod->NBLCopyPool)
-			NPF_FreeObjectPool(pFiltMod->NBLCopyPool);
 		if (pFiltMod->InternalRequestPool)
 			NPF_FreeObjectPool(pFiltMod->InternalRequestPool);
 		if (pFiltMod->TapNBPool)
@@ -2440,7 +2441,6 @@ NPF_AttachAdapter(
 			break;
 		}
 
-		pFiltMod->AdapterHandle = NdisFilterHandle;
 		pFiltMod->HigherPacketFilter = NPF_GetPacketFilter(pFiltMod);
 		TRACE_MESSAGE1(PACKET_DEBUG_LOUD,
 			"HigherPacketFilter=%x",
@@ -2541,6 +2541,8 @@ NPF_Restart(
 
 	PNPCAP_FILTER_MODULE pFiltMod = (PNPCAP_FILTER_MODULE)FilterModuleContext;
 	NDIS_STATUS		Status;
+	NTSTATUS ntStatus;
+	UINT Mtu;
 	PNDIS_RESTART_ATTRIBUTES Curr = RestartParameters->RestartAttributes;
 	PNDIS_RESTART_GENERAL_ATTRIBUTES GenAttr = NULL;
 
@@ -2555,12 +2557,15 @@ NPF_Restart(
 	NdisAcquireSpinLock(&pFiltMod->AdapterHandleLock);
 	ASSERT(pFiltMod->AdapterBindingStatus == FilterPaused);
 	pFiltMod->AdapterBindingStatus = FilterRestarting;
+	NdisReleaseSpinLock(&pFiltMod->AdapterHandleLock);
 
 	Status = NPF_ValidateParameters(pFiltMod->Dot11, RestartParameters->MiniportMediaType);
 	if (Status != NDIS_STATUS_SUCCESS) {
 		goto NPF_Restart_End;
 	}
 
+	// MtuSize is actually OID_GEN_MAXIMUM_FRAME_SIZE and does not include link header
+	// We'll grab it because it's available, but we'll try to get something better
 	while (Curr) {
 		if (Curr->Oid == OID_GEN_MINIPORT_RESTART_ATTRIBUTES) {
 			GenAttr = (PNDIS_RESTART_GENERAL_ATTRIBUTES) Curr->Data;
@@ -2569,9 +2574,17 @@ NPF_Restart(
 		}
 		Curr = Curr->Next;
 	}
+	// Now try OID_GEN_MAXIMUM_TOTAL_SIZE, including link header
+	// If it fails, no big deal; we have the MTU at least.
+	ntStatus = NPF_GetDeviceMTU(pFiltMod, &Mtu);
+	if (NT_SUCCESS(ntStatus))
+	{
+		pFiltMod->MaxFrameSize = Mtu;
+	}
 
 
 NPF_Restart_End:
+	NdisAcquireSpinLock(&pFiltMod->AdapterHandleLock);
 	pFiltMod->AdapterBindingStatus = NDIS_STATUS_SUCCESS == Status ? FilterRunning : FilterPaused;
 	NdisReleaseSpinLock(&pFiltMod->AdapterHandleLock);
 
