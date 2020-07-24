@@ -295,7 +295,7 @@ DriverEntry(
 			NPF_GetRegistryOption_String(&parametersPath, &g_LoopbackRegValueName, &g_LoopbackAdapterName);
 			if (g_LoopbackAdapterName.Buffer != NULL && g_LoopbackAdapterName.Length != ADAPTER_NAME_SIZE * 2)
 			{
-				TRACE_MESSAGE2(PACKET_DEBUG_LOUD, "g_LoopbackAdapterName is invalid, g_LoopbackAdapterName.Length = %d, ADAPTER_NAME_SIZE * 2 = %d\n",
+				TRACE_MESSAGE2(PACKET_DEBUG_LOUD, "g_LoopbackAdapterName is invalid, g_LoopbackAdapterName.Length = %lu, ADAPTER_NAME_SIZE * 2 = %zu\n",
 						g_LoopbackAdapterName.Length, ADAPTER_NAME_SIZE * 2);
 				ExFreePool(g_LoopbackAdapterName.Buffer);
 				g_LoopbackAdapterName.Buffer = NULL;
@@ -423,8 +423,6 @@ DriverEntry(
 	}
 
 	devExtP->ExportString = deviceSymLink.Buffer;
-	devExtP->DetachedOpens.Next = NULL;
-	KeInitializeSpinLock(&devExtP->DetachedOpensLock);
 
 	/* Have to set this up before NdisFRegisterFilterDriver, since we can get Attach calls immediately after that! */
 	NdisAllocateSpinLock(&g_FilterArrayLock);
@@ -829,7 +827,7 @@ NPF_GetRegistryOption_String(
 				}
 				else
 				{
-					IF_LOUD(DbgPrint("\"%ws\" Key = %ws\n", RegValueName->Buffer, valueInfoP->Data);)
+					IF_LOUD(DbgPrint("\"%ws\" Key = %ws\n", RegValueName->Buffer, (PWSTR) valueInfoP->Data);)
 
 					g_OutputString->Length = (USHORT)(valueInfoP->DataLength - sizeof(UNICODE_NULL));
 					g_OutputString->MaximumLength = (USHORT)(valueInfoP->DataLength);
@@ -878,13 +876,14 @@ Return Value:
 
 --*/
 {
-	PSINGLE_LIST_ENTRY Curr = NULL;
+	PLIST_ENTRY CurrEntry = NULL;
 	PDEVICE_OBJECT DeviceObject;
 	PDEVICE_OBJECT OldDeviceObject;
 	PDEVICE_EXTENSION DeviceExtension;
 	NDIS_STATUS Status;
 	NDIS_STRING SymLink;
 	NDIS_EVENT Event;
+	LOCK_STATE_EX lockState;
 
 	TRACE_ENTER();
 
@@ -937,16 +936,23 @@ Return Value:
 		TRACE_MESSAGE2(PACKET_DEBUG_LOUD, "Deleting Adapter, Device Obj=%p (%p)",
 				DeviceObject, OldDeviceObject);
 
-		Curr = DeviceExtension->DetachedOpens.Next;
-		while (Curr != NULL)
+		NdisAcquireRWLockWrite(DeviceExtension->AllOpensLock, &lockState, 0);
+		for (CurrEntry = DeviceExtension->AllOpens.Flink;
+				CurrEntry != &DeviceExtension->AllOpens;
+				CurrEntry = CurrEntry->Flink)
 		{
-			POPEN_INSTANCE pOpen = CONTAINING_RECORD(Curr, OPEN_INSTANCE, OpenInstancesEntry);
-			Curr = Curr->Next;
+			POPEN_INSTANCE pOpen = CONTAINING_RECORD(CurrEntry, OPEN_INSTANCE, AllOpensEntry);
+			if (pOpen->OpenStatus == OpenDetached)
+			{
+				CurrEntry = CurrEntry->Blink;
+				RemoveEntryList(&pOpen->AllOpensEntry);
 
-			NPF_CloseOpenInstance(pOpen);
-			NPF_ReleaseOpenInstanceResources(pOpen);
-			ExFreePool(pOpen);
+				NPF_CloseOpenInstance(pOpen);
+				NPF_ReleaseOpenInstanceResources(pOpen);
+				ExFreePool(pOpen);
+			}
 		}
+		NdisReleaseRWLock(DeviceExtension->AllOpensLock, &lockState);
 
 		if (DeviceExtension->ExportString)
 		{
@@ -1096,9 +1102,9 @@ NPF_IoControl(
 	HANDLE					hUserEvent;
 	PKEVENT					pKernelEvent;
 	LOCK_STATE_EX lockState;
-#ifdef _AMD64_
+#ifdef _WIN64
 	VOID* POINTER_32		hUserEvent32Bit;
-#endif //_AMD64_
+#endif //_WIN64
 
 	TRACE_ENTER();
 
@@ -1147,7 +1153,7 @@ NPF_IoControl(
 			break;
 	}
 
-	if (!NPF_StartUsingOpenInstance(Open, MaxState))
+	if (!NPF_StartUsingOpenInstance(Open, MaxState, NPF_IRQL_UNKNOWN))
 	{
 		SET_FAILURE(Open->OpenStatus == OpenDetached
 				? STATUS_DEVICE_REMOVED
@@ -1159,13 +1165,15 @@ NPF_IoControl(
 		return Status;
 	}
 
-#define FAIL_IF_BUFFER_SMALL(__size__) \
+#define _FAIL_IF_BUFFER_SMALL(__size__, __lenparam__) \
 	if (Irp->AssociatedIrp.SystemBuffer == NULL || \
-		IrpSp->Parameters.DeviceIoControl.OutputBufferLength < __size__) \
+		IrpSp->Parameters.DeviceIoControl.__lenparam__ < __size__) \
 	{ \
 		SET_FAILURE_BUFFER(__size__); \
 		break; \
 	}
+#define FAIL_IF_INPUT_SMALL(__size__) _FAIL_IF_BUFFER_SMALL(__size__, InputBufferLength)
+#define FAIL_IF_OUTPUT_SMALL(__size__) _FAIL_IF_BUFFER_SMALL(__size__, OutputBufferLength)
 
 	switch (FunctionCode)
 	{
@@ -1175,12 +1183,7 @@ NPF_IoControl(
 		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "BIOCGSTATS");
 
 		StatsLength = 4 * sizeof(UINT);
-		FAIL_IF_BUFFER_SMALL(StatsLength);
-
-		//
-		// temp fix to a GIANT bug from LD. The CTL code has been defined as METHOD_NEITHER, so it
-		// might well be a dangling pointer. We need to probe and lock the address.
-		//
+		FAIL_IF_OUTPUT_SMALL(StatsLength);
 
 		pStats = (PUINT)(Irp->AssociatedIrp.SystemBuffer);
 		
@@ -1254,7 +1257,7 @@ NPF_IoControl(
 	case BIOCSETF:
 		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "BIOCSETF");
 
-		FAIL_IF_BUFFER_SMALL(sizeof(struct bpf_insn));
+		FAIL_IF_INPUT_SMALL(sizeof(struct bpf_insn));
 		//
 		// Get the pointer to the new program
 		//
@@ -1339,7 +1342,7 @@ NPF_IoControl(
 
 		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "BIOCSMODE");
 
-		FAIL_IF_BUFFER_SMALL(sizeof(ULONG));
+		FAIL_IF_INPUT_SMALL(sizeof(ULONG));
 
 		mode = *((PULONG)Irp->AssociatedIrp.SystemBuffer);
 
@@ -1498,7 +1501,7 @@ NPF_IoControl(
 		break;
 
 	case BIOCISETLOBBEH:
-		FAIL_IF_BUFFER_SMALL(sizeof(INT));
+		FAIL_IF_INPUT_SMALL(sizeof(INT));
 
 		if (*(PINT) Irp->AssociatedIrp.SystemBuffer == NPF_DISABLE_LOOPBACK)
 		{
@@ -1526,7 +1529,7 @@ NPF_IoControl(
 
 		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "BIOCSETEVENTHANDLE");
 
-#ifdef _AMD64_
+#ifdef _WIN64
 		if (IoIs32bitProcess(Irp))
 		{
 			//
@@ -1542,7 +1545,7 @@ NPF_IoControl(
 			hUserEvent = hUserEvent32Bit;
 		}
 		else
-#endif //_AMD64_
+#endif //_WIN64
 		{
 			//
 			// validate the input
@@ -1590,7 +1593,7 @@ NPF_IoControl(
 	case BIOCSETBUFFERSIZE:
 		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "BIOCSETBUFFERSIZE");
 
-		FAIL_IF_BUFFER_SMALL(sizeof(ULONG));
+		FAIL_IF_INPUT_SMALL(sizeof(ULONG));
 
 		// Get the number of bytes to allocate
 		dim = *((PULONG)Irp->AssociatedIrp.SystemBuffer);
@@ -1626,7 +1629,7 @@ NPF_IoControl(
 
 		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "BIOCSRTIMEOUT");
 
-		FAIL_IF_BUFFER_SMALL(sizeof(ULONG));
+		FAIL_IF_INPUT_SMALL(sizeof(ULONG));
 
 		timeout = *((PULONG)Irp->AssociatedIrp.SystemBuffer);
 		if (timeout == (ULONG) - 1)
@@ -1649,7 +1652,7 @@ NPF_IoControl(
 
 		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "BIOCSWRITEREP");
 
-		FAIL_IF_BUFFER_SMALL(sizeof(ULONG));
+		FAIL_IF_INPUT_SMALL(sizeof(ULONG));
 
 		Open->Nwrites = *((PULONG)Irp->AssociatedIrp.SystemBuffer);
 
@@ -1663,7 +1666,7 @@ NPF_IoControl(
 
 		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "BIOCSMINTOCOPY");
 
-		FAIL_IF_BUFFER_SMALL(sizeof(ULONG));
+		FAIL_IF_INPUT_SMALL(sizeof(ULONG));
 
 		Open->MinToCopy = *((PULONG)Irp->AssociatedIrp.SystemBuffer);
 
@@ -1677,7 +1680,7 @@ NPF_IoControl(
 		TRACE_MESSAGE3(PACKET_DEBUG_LOUD, "%s Request: Oid=%08lx, Length=%08lx", FunctionCode == BIOCQUERYOID ? "BIOCQUERYOID" : "BIOCSETOID", OidData->Oid, OidData->Length);
 
 		// Extract a request from the list of free ones
-		pRequest = (PINTERNAL_REQUEST) NPF_ObjectPoolGet(Open->pFiltMod->InternalRequestPool);
+		pRequest = (PINTERNAL_REQUEST) NPF_ObjectPoolGet(Open->pFiltMod->InternalRequestPool, NPF_IRQL_UNKNOWN);
 		if (pRequest == NULL)
 		{
 			TRACE_MESSAGE(PACKET_DEBUG_LOUD, "pRequest=NULL");
@@ -1837,7 +1840,7 @@ NPF_IoControl(
 				// Disable setting Packet Filter for wireless adapters, because this will cause limited connectivity.
 				if (Open->pFiltMod->PhysicalMedium == NdisPhysicalMediumNative802_11)
 				{
-					TRACE_MESSAGE2(PACKET_DEBUG_LOUD, "Wireless adapter can't set packet filter, will bypass this request, *(ULONG*)OidData->Data = %#lx, MyPacketFilter = %p",
+					TRACE_MESSAGE2(PACKET_DEBUG_LOUD, "Wireless adapter can't set packet filter, will bypass this request, *(ULONG*)OidData->Data = %#lx, MyPacketFilter = %#lx",
 						*(ULONG*)OidData->Data, Open->pFiltMod->MyPacketFilter);
 					SET_RESULT_SUCCESS(sizeof(PACKET_OID_DATA) - 1 + OidData->Length);
 
@@ -1965,12 +1968,12 @@ NPF_IoControl(
 
 OID_REQUEST_DONE:
 
-		NPF_ObjectPoolReturn(pRequest, NULL);
+		NPF_ObjectPoolReturn(pRequest, NULL, NPF_IRQL_UNKNOWN);
 
 		break;
 
 	case BIOCSTIMESTAMPMODE:
-		FAIL_IF_BUFFER_SMALL(sizeof(ULONG));
+		FAIL_IF_INPUT_SMALL(sizeof(ULONG));
 
 		dim = *((PULONG)Irp->AssociatedIrp.SystemBuffer);
 		
@@ -1990,7 +1993,7 @@ OID_REQUEST_DONE:
 
 	case BIOCGETPIDS:
 		// Need to at least deliver the number of PIDS
-		FAIL_IF_BUFFER_SMALL(sizeof(ULONG));
+		FAIL_IF_OUTPUT_SMALL(sizeof(ULONG));
 
 		dim = IrpSp->Parameters.DeviceIoControl.OutputBufferLength / sizeof(ULONG);
 		cnt = 0;
@@ -2031,7 +2034,7 @@ OID_REQUEST_DONE:
 	//
 	// release the Open structure
 	//
-	NPF_StopUsingOpenInstance(Open, MaxState);
+	NPF_StopUsingOpenInstance(Open, MaxState, NPF_IRQL_UNKNOWN);
 
 	//
 	// complete the IRP

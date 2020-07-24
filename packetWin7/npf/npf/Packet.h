@@ -94,8 +94,20 @@
 
 #include "win_bpf.h"
 
-#define FILTER_ACQUIRE_LOCK(_pLock, DispatchLevel) NdisAcquireSpinLock(_pLock)
-#define FILTER_RELEASE_LOCK(_pLock, DispatchLevel) NdisReleaseSpinLock(_pLock)
+/* If DISPATCH_LEVEL can be determined, use that in the FILTER_*_LOCK macros
+ * Otherwise, use NPF_IRQL_UNKNOWN so we can find and update them as we add more tracking
+ */
+#define NPF_IRQL_UNKNOWN FALSE
+#define FILTER_ACQUIRE_LOCK(_pLock, DispatchLevel) if (DispatchLevel) { \
+	NdisDprAcquireSpinLock(_pLock); \
+} else { \
+	NdisAcquireSpinLock(_pLock); \
+}
+#define FILTER_RELEASE_LOCK(_pLock, DispatchLevel) if (DispatchLevel) { \
+	NdisDprReleaseSpinLock(_pLock); \
+} else { \
+	NdisReleaseSpinLock(_pLock); \
+}
 
 typedef struct _NDIS_OID_REQUEST *FILTER_REQUEST_CONTEXT,**PFILTER_REQUEST_CONTEXT;
 
@@ -250,8 +262,6 @@ typedef struct _DEVICE_EXTENSION
 {
 	PWSTR		ExportString;			///< Name of the exported device, i.e. name that the applications will use
 										///< to open this adapter through Packet.dll.
-	SINGLE_LIST_ENTRY DetachedOpens; //GroupHead
-	KSPIN_LOCK DetachedOpensLock; // GroupLock
 	LIST_ENTRY AllOpens;
 	PNDIS_RW_LOCK_EX AllOpensLock;
 	NDIS_HANDLE FilterDriverHandle;
@@ -453,7 +463,7 @@ typedef struct _NPF_NBL_COPY
 #endif
 } NPF_NBL_COPY, *PNPF_NBL_COPY;
 
-VOID NPF_FreeNBLCopy(_In_ PNPF_NBL_COPY pNBLCopy);
+VOID NPF_FreeNBLCopy(_In_ PNPF_NBL_COPY pNBLCopy, _In_ BOOLEAN bAtDispatchLevel);
 
 typedef struct _NPF_NB_COPIES
 {
@@ -463,7 +473,7 @@ typedef struct _NPF_NB_COPIES
 	ULONG ulSize; //Size of all allocated space in the netbuffer.
 } NPF_NB_COPIES, *PNPF_NB_COPIES;
 
-VOID NPF_FreeNBCopies(_In_ PNPF_NB_COPIES pNBCopy);
+VOID NPF_FreeNBCopies(_In_ PNPF_NB_COPIES pNBCopy, _In_ BOOLEAN bAtDispatchLevel);
 
 /* Structure of a captured packet data description */
 typedef struct _NPF_CAP_DATA
@@ -474,7 +484,7 @@ typedef struct _NPF_CAP_DATA
 }
 NPF_CAP_DATA, *PNPF_CAP_DATA;
 
-VOID NPF_FreeCapData(_In_ PNPF_CAP_DATA pCapData);
+VOID NPF_FreeCapData(_In_ PNPF_CAP_DATA pCapData, _In_ BOOLEAN bAtDispatchLevel);
 
 #ifdef HAVE_DOT11_SUPPORT
 #define NPF_CAP_SIZE(_P, _R) ((_P)->BpfHeader.bh_hdrlen \
@@ -1125,13 +1135,13 @@ NTSTATUS NPF_CloseDumpFile(POPEN_INSTANCE Open);
 
 BOOLEAN NPF_IsOpenInstance(_In_ POPEN_INSTANCE pOpen);
 
-BOOLEAN NPF_StartUsingBinding(_In_ PNPCAP_FILTER_MODULE pFiltMod);
+BOOLEAN NPF_StartUsingBinding(_In_ PNPCAP_FILTER_MODULE pFiltMod, _In_ BOOLEAN AtDispatchLevel);
 
-VOID NPF_StopUsingBinding(_In_ PNPCAP_FILTER_MODULE pFiltMod);
+VOID NPF_StopUsingBinding(_In_ PNPCAP_FILTER_MODULE pFiltMod, _In_ BOOLEAN AtDispatchLevel);
 
-BOOLEAN NPF_StartUsingOpenInstance(_In_ POPEN_INSTANCE pOpen, _In_ OPEN_STATE MaxOpen);
+BOOLEAN NPF_StartUsingOpenInstance(_In_ POPEN_INSTANCE pOpen, _In_ OPEN_STATE MaxOpen, _In_ BOOLEAN AtDispatchLevel);
 
-VOID NPF_StopUsingOpenInstance(_In_ POPEN_INSTANCE pOpen, _In_ OPEN_STATE MaxOpen);
+VOID NPF_StopUsingOpenInstance(_In_ POPEN_INSTANCE pOpen, _In_ OPEN_STATE MaxOpen, _In_ BOOLEAN AtDispatchLevel);
 
 VOID NPF_CloseOpenInstance(_In_ POPEN_INSTANCE pOpen);
 

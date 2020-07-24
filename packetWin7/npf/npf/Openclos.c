@@ -295,7 +295,7 @@ NPF_IsOpenInstance(
 _Use_decl_annotations_
 BOOLEAN
 NPF_StartUsingBinding(
-	PNPCAP_FILTER_MODULE pFiltMod
+	PNPCAP_FILTER_MODULE pFiltMod, BOOLEAN AtDispatchLevel
 	)
 {
 	if (!pFiltMod) {
@@ -304,17 +304,17 @@ NPF_StartUsingBinding(
 	// NPF_OpenAdapter() is not called on PASSIVE_LEVEL, so the assertion will fail.
 	// ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
 
-	NdisAcquireSpinLock(&pFiltMod->AdapterHandleLock);
+	FILTER_ACQUIRE_LOCK(&pFiltMod->AdapterHandleLock, AtDispatchLevel);
 
 	if (pFiltMod->AdapterBindingStatus != FilterRunning)
 	{
-		NdisReleaseSpinLock(&pFiltMod->AdapterHandleLock);
+		FILTER_RELEASE_LOCK(&pFiltMod->AdapterHandleLock, AtDispatchLevel);
 		return FALSE;
 	}
 
 	pFiltMod->AdapterHandleUsageCounter++;
 
-	NdisReleaseSpinLock(&pFiltMod->AdapterHandleLock);
+	FILTER_RELEASE_LOCK(&pFiltMod->AdapterHandleLock, AtDispatchLevel);
 
 	return TRUE;
 }
@@ -324,7 +324,7 @@ NPF_StartUsingBinding(
 _Use_decl_annotations_
 VOID
 NPF_StopUsingBinding(
-	PNPCAP_FILTER_MODULE pFiltMod
+	PNPCAP_FILTER_MODULE pFiltMod, BOOLEAN AtDispatchLevel
 	)
 {
 	ASSERT(pFiltMod != NULL);
@@ -335,13 +335,13 @@ NPF_StopUsingBinding(
 	//
 	//	ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
 
-	NdisAcquireSpinLock(&pFiltMod->AdapterHandleLock);
+	FILTER_ACQUIRE_LOCK(&pFiltMod->AdapterHandleLock, AtDispatchLevel);
 
 	ASSERT(pFiltMod->AdapterHandleUsageCounter > 0);
 
 	pFiltMod->AdapterHandleUsageCounter--;
 
-	NdisReleaseSpinLock(&pFiltMod->AdapterHandleLock);
+	FILTER_RELEASE_LOCK(&pFiltMod->AdapterHandleLock, AtDispatchLevel);
 }
 
 //-------------------------------------------------------------------
@@ -401,7 +401,8 @@ NPF_ResetBufferContents(
 	for (Curr = Open->PacketQueue.Flink; Curr != &Open->PacketQueue; Curr = Curr->Flink)
 	{
 		pCapData = CONTAINING_RECORD(Curr, NPF_CAP_DATA, PacketQueueEntry);
-		NPF_ObjectPoolReturn(pCapData, NPF_FreeCapData);
+		// If AcquireLock, then we are at DISPATCH_LEVEL
+		NPF_ObjectPoolReturn(pCapData, NPF_FreeCapData, AcquireLock);
 	}
 	// Remove links
 	InitializeListHead(&Open->PacketQueue);
@@ -412,11 +413,13 @@ NPF_ResetBufferContents(
 }
 
 _Use_decl_annotations_
-VOID NPF_FreeNBCopies(PNPF_NB_COPIES pNBCopy)
+VOID NPF_FreeNBCopies(PNPF_NB_COPIES pNBCopy, BOOLEAN bAtDispatchLevel)
 {
 	PVOID pDeleteMe = NULL;
 	PMDL pMdl = NULL;
 	ULONG ulSize = 0;
+
+	UNREFERENCED_PARAMETER(bAtDispatchLevel);
 
 	if (pNBCopy->pNetBuffer != NULL)
 	{
@@ -445,7 +448,7 @@ VOID NPF_FreeNBCopies(PNPF_NB_COPIES pNBCopy)
 
 /* NPF_ObjectPoolReturn Free handler for NBLCopyPool */
 _Use_decl_annotations_
-VOID NPF_FreeNBLCopy(PNPF_NBL_COPY pNBLCopy)
+VOID NPF_FreeNBLCopy(PNPF_NBL_COPY pNBLCopy, BOOLEAN bAtDispatchLevel)
 {
 	PNPF_NB_COPIES pNBCopies = NULL;
 	PSINGLE_LIST_ENTRY pNBCopiesEntry = NULL;
@@ -456,20 +459,20 @@ VOID NPF_FreeNBLCopy(PNPF_NBL_COPY pNBLCopy)
 		pNBCopies = CONTAINING_RECORD(pNBCopiesEntry, NPF_NB_COPIES, CopiesEntry);
 		pNBCopiesEntry = pNBCopiesEntry->Next;
 
-		NPF_ObjectPoolReturn(pNBCopies, NPF_FreeNBCopies);
+		NPF_ObjectPoolReturn(pNBCopies, NPF_FreeNBCopies, bAtDispatchLevel);
 	}
 
 	if (pNBLCopy->Dot11RadiotapHeader != NULL)
 	{
-		NPF_ObjectPoolReturn(pNBLCopy->Dot11RadiotapHeader, NULL);
+		NPF_ObjectPoolReturn(pNBLCopy->Dot11RadiotapHeader, NULL, bAtDispatchLevel);
 	}
 }
 
 _Use_decl_annotations_
-VOID NPF_FreeCapData(PNPF_CAP_DATA pCapData)
+VOID NPF_FreeCapData(PNPF_CAP_DATA pCapData, BOOLEAN bAtDispatchLevel)
 {
-	NPF_ObjectPoolReturn(pCapData->pNBCopy->pNBLCopy, NPF_FreeNBLCopy);
-	NPF_ObjectPoolReturn(pCapData->pNBCopy, NPF_FreeNBCopies);
+	NPF_ObjectPoolReturn(pCapData->pNBCopy->pNBLCopy, NPF_FreeNBLCopy, bAtDispatchLevel);
+	NPF_ObjectPoolReturn(pCapData->pNBCopy, NPF_FreeNBCopies, bAtDispatchLevel);
 }
 
 VOID
@@ -557,7 +560,7 @@ NPF_OpenAdapter(
 			return STATUS_NDIS_INTERFACE_NOT_FOUND;
 		}
 
-		if (NPF_StartUsingBinding(pFiltMod) == FALSE)
+		if (NPF_StartUsingBinding(pFiltMod, NPF_IRQL_UNKNOWN) == FALSE)
 		{
 			TRACE_MESSAGE1(PACKET_DEBUG_LOUD,
 				"NPF_StartUsingBinding error, AdapterName=%ws",
@@ -577,7 +580,7 @@ NPF_OpenAdapter(
 	if (Open == NULL)
 	{
 		if (pFiltMod)
-			NPF_StopUsingBinding(pFiltMod);
+			NPF_StopUsingBinding(pFiltMod, NPF_IRQL_UNKNOWN);
 		Irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
 		TRACE_EXIT();
@@ -609,7 +612,7 @@ NPF_OpenAdapter(
 		ExFreePool(Open);
 		Open = NULL;
 
-		NPF_StopUsingBinding(pFiltMod);
+		NPF_StopUsingBinding(pFiltMod, NPF_IRQL_UNKNOWN);
 
 		Irp->IoStatus.Status = Status;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -632,7 +635,11 @@ NPF_OpenAdapter(
 	if (pFiltMod)
 	{
 		NPF_AddToGroupOpenArray(Open, pFiltMod);
-		NPF_StopUsingBinding(pFiltMod);
+		NPF_StopUsingBinding(pFiltMod, NPF_IRQL_UNKNOWN);
+	}
+	else
+	{
+		Open->OpenStatus = OpenDetached;
 	}
 
 	Irp->IoStatus.Status = Status;
@@ -649,6 +656,11 @@ NTSTATUS NPF_EnableOps(_In_ PNPCAP_FILTER_MODULE pFiltMod, _In_ PDEVICE_OBJECT p
 {
 	NTSTATUS Status = STATUS_PENDING;
 	NDIS_EVENT Event;
+
+	if (pFiltMod == NULL)
+	{
+		return STATUS_INVALID_DEVICE_REQUEST;
+	}
 
 	NdisAcquireSpinLock(&pFiltMod->AdapterHandleLock);
 	switch(pFiltMod->OpsState)
@@ -749,24 +761,23 @@ NTSTATUS NPF_EnableOps(_In_ PNPCAP_FILTER_MODULE pFiltMod, _In_ PDEVICE_OBJECT p
 _Use_decl_annotations_
 BOOLEAN
 NPF_StartUsingOpenInstance(
-	POPEN_INSTANCE pOpen, OPEN_STATE MaxState)
-
+	POPEN_INSTANCE pOpen, OPEN_STATE MaxState, BOOLEAN AtDispatchLevel)
 {
 	BOOLEAN returnStatus;
 
-	if (MaxState <= OpenAttached && !NPF_StartUsingBinding(pOpen->pFiltMod))
+	if (MaxState <= OpenAttached && !NPF_StartUsingBinding(pOpen->pFiltMod, AtDispatchLevel))
 	{
 		// Not attached, but need to be.
 		return FALSE;
 	}
 
-	NdisAcquireSpinLock(&pOpen->OpenInUseLock);
+	FILTER_ACQUIRE_LOCK(&pOpen->OpenInUseLock, AtDispatchLevel);
 	if (MaxState == OpenRunning && pOpen->OpenStatus == OpenAttached)
 	{
 		// NPF_EnableOps must be called at PASSIVE_LEVEL. Release the lock first.
-		NdisReleaseSpinLock(&pOpen->OpenInUseLock);
+		FILTER_RELEASE_LOCK(&pOpen->OpenInUseLock, AtDispatchLevel);
 		returnStatus = NT_SUCCESS(NPF_EnableOps(pOpen->pFiltMod, pOpen->DeviceExtension->pDevObj));
-		NdisAcquireSpinLock(&pOpen->OpenInUseLock);
+		FILTER_ACQUIRE_LOCK(&pOpen->OpenInUseLock, AtDispatchLevel);
 
 		if (returnStatus)
 		{
@@ -803,7 +814,7 @@ NPF_StartUsingOpenInstance(
 		returnStatus = TRUE;
 		pOpen->PendingIrps[MaxState]++;
 	}
-	NdisReleaseSpinLock(&pOpen->OpenInUseLock);
+	FILTER_RELEASE_LOCK(&pOpen->OpenInUseLock, AtDispatchLevel);
 
 	return returnStatus;
 }
@@ -814,17 +825,18 @@ _Use_decl_annotations_
 VOID
 NPF_StopUsingOpenInstance(
 	POPEN_INSTANCE pOpen,
-	OPEN_STATE MaxState
+	OPEN_STATE MaxState,
+	BOOLEAN AtDispatchLevel
 	)
 {
-	NdisAcquireSpinLock(&pOpen->OpenInUseLock);
+	FILTER_ACQUIRE_LOCK(&pOpen->OpenInUseLock, AtDispatchLevel);
 	ASSERT(pOpen->PendingIrps[MaxState] > 0);
 	pOpen->PendingIrps[MaxState]--;
-	NdisReleaseSpinLock(&pOpen->OpenInUseLock);
+	FILTER_RELEASE_LOCK(&pOpen->OpenInUseLock, AtDispatchLevel);
 
 	if (MaxState <= OpenAttached)
 	{
-		NPF_StopUsingBinding(pOpen->pFiltMod);
+		NPF_StopUsingBinding(pOpen->pFiltMod, AtDispatchLevel);
 	}
 }
 
@@ -925,11 +937,6 @@ NPF_DetachOpenInstance(
 	}
 
 	pOpen->pFiltMod = NULL;
-
-	ExInterlockedPushEntryList(
-			&pOpen->DeviceExtension->DetachedOpens,
-			&pOpen->OpenInstancesEntry,
-			&pOpen->DeviceExtension->DetachedOpensLock);
 }
 
 //-------------------------------------------------------------------
@@ -1870,14 +1877,14 @@ NPF_GetFilterModuleByAdapterName(
 	for (Curr = g_arrFiltMod.Next; Curr != NULL; Curr = Curr->Next)
 	{
 		pFiltMod = CONTAINING_RECORD(Curr, NPCAP_FILTER_MODULE, FilterModulesEntry);
-		if (NPF_StartUsingBinding(pFiltMod) == FALSE)
+		if (NPF_StartUsingBinding(pFiltMod, NPF_IRQL_UNKNOWN) == FALSE)
 		{
 			continue;
 		}
 
 		if (pFiltMod->Dot11 == Dot11 && NPF_EqualAdapterName(&pFiltMod->AdapterName, &BaseName))
 		{
-			NPF_StopUsingBinding(pFiltMod);
+			NPF_StopUsingBinding(pFiltMod, NPF_IRQL_UNKNOWN);
 			NdisReleaseSpinLock(&g_FilterArrayLock);
 			if (!Loopback) {
 				ExFreePoolWithTag(BaseName.Buffer, 'GFBN');
@@ -1886,7 +1893,7 @@ NPF_GetFilterModuleByAdapterName(
 		}
 		else
 		{
-			NPF_StopUsingBinding(pFiltMod);
+			NPF_StopUsingBinding(pFiltMod, NPF_IRQL_UNKNOWN);
 		}
 	}
 	NdisReleaseSpinLock(&g_FilterArrayLock);
@@ -1912,20 +1919,20 @@ NPF_GetLoopbackFilterModule()
 	for (Curr = g_arrFiltMod.Next; Curr != NULL; Curr = Curr->Next)
 	{
 		pFiltMod = CONTAINING_RECORD(Curr, NPCAP_FILTER_MODULE, FilterModulesEntry);
-		if (NPF_StartUsingBinding(pFiltMod) == FALSE)
+		if (NPF_StartUsingBinding(pFiltMod, NPF_IRQL_UNKNOWN) == FALSE)
 		{
 			continue;
 		}
 
 		if (pFiltMod->Loopback)
 		{
-			NPF_StopUsingBinding(pFiltMod);
+			NPF_StopUsingBinding(pFiltMod, NPF_IRQL_UNKNOWN);
 			NdisReleaseSpinLock(&g_FilterArrayLock);
 			return pFiltMod;
 		}
 		else
 		{
-			NPF_StopUsingBinding(pFiltMod);
+			NPF_StopUsingBinding(pFiltMod, NPF_IRQL_UNKNOWN);
 		}
 	}
 	NdisReleaseSpinLock(&g_FilterArrayLock);
@@ -2379,6 +2386,7 @@ NPF_AttachAdapter(
 			TRACE_EXIT();
 			return returnStatus;
 		}
+		pFiltMod->AdapterBindingStatus = FilterAttaching;
 
 #ifdef HAVE_RX_SUPPORT
 		// Determine whether this is our send-to-Rx adapter for the open_instance.
@@ -2471,6 +2479,7 @@ NPF_AttachAdapter(
 #endif
 
 		returnStatus = STATUS_SUCCESS;
+		pFiltMod->AdapterBindingStatus = FilterPaused;
 		NPF_AddToFilterModuleArray(pFiltMod);
 	}
 	while (bFalse);
@@ -2511,6 +2520,7 @@ NPF_Pause(
 	NdisResetEvent(&Event);
 
 	NdisAcquireSpinLock(&pFiltMod->AdapterHandleLock);
+	ASSERT(pFiltMod->AdapterBindingStatus == FilterRunning);
 	pFiltMod->AdapterBindingStatus = FilterPausing;
 	
 	while (pFiltMod->AdapterHandleUsageCounter > 0)
@@ -2819,9 +2829,8 @@ Arguments:
 	PNDIS_OID_REQUEST                   Request = NULL;
 	PFILTER_REQUEST_CONTEXT             Context;
 	PNDIS_OID_REQUEST                   OriginalRequest = NULL;
-	BOOLEAN                             bFalse = FALSE;
 
-	FILTER_ACQUIRE_LOCK(&pFiltMod->OIDLock, bFalse);
+	FILTER_ACQUIRE_LOCK(&pFiltMod->OIDLock, NPF_IRQL_UNKNOWN);
 
 	Request = pFiltMod->PendingOidRequest;
 
@@ -2834,13 +2843,13 @@ Arguments:
 
 	if ((OriginalRequest != NULL) && (OriginalRequest->RequestId == RequestId))
 	{
-		FILTER_RELEASE_LOCK(&pFiltMod->OIDLock, bFalse);
+		FILTER_RELEASE_LOCK(&pFiltMod->OIDLock, NPF_IRQL_UNKNOWN);
 
 		NdisFCancelOidRequest(pFiltMod->AdapterHandle, RequestId);
 	}
 	else
 	{
-		FILTER_RELEASE_LOCK(&pFiltMod->OIDLock, bFalse);
+		FILTER_RELEASE_LOCK(&pFiltMod->OIDLock, NPF_IRQL_UNKNOWN);
 	}
 }
 
@@ -2879,7 +2888,6 @@ Arguments:
 	PNPCAP_FILTER_MODULE pFiltMod = (PNPCAP_FILTER_MODULE) FilterModuleContext;
 	PNDIS_OID_REQUEST                   OriginalRequest;
 	PFILTER_REQUEST_CONTEXT             Context;
-	BOOLEAN                             bFalse = FALSE;
 
 	TRACE_ENTER();
 
@@ -2898,12 +2906,12 @@ Arguments:
 	}
 
 
-	FILTER_ACQUIRE_LOCK(&pFiltMod->OIDLock, bFalse);
+	FILTER_ACQUIRE_LOCK(&pFiltMod->OIDLock, NPF_IRQL_UNKNOWN);
 
 	ASSERT(pFiltMod->PendingOidRequest == Request);
 	pFiltMod->PendingOidRequest = NULL;
 
-	FILTER_RELEASE_LOCK(&pFiltMod->OIDLock, bFalse);
+	FILTER_RELEASE_LOCK(&pFiltMod->OIDLock, NPF_IRQL_UNKNOWN);
 
 
 	//
@@ -3243,7 +3251,7 @@ NPF_GetPacketFilter(
 
 	if (BytesProcessed != sizeof(PacketFilter))
 	{
-		IF_LOUD(DbgPrint("BytesProcessed != sizeof(PacketFilter), BytesProcessed = %x, sizeof(PacketFilter) = %x\n", BytesProcessed, sizeof(PacketFilter));)
+		IF_LOUD(DbgPrint("BytesProcessed != sizeof(PacketFilter), BytesProcessed = %#lx, sizeof(PacketFilter) = %#zx\n", BytesProcessed, sizeof(PacketFilter));)
 		TRACE_EXIT();
 		return 0;
 	}
@@ -3346,7 +3354,7 @@ NPF_SetPacketFilter(
 
 	if (BytesProcessed != sizeof(PacketFilter))
 	{
-		IF_LOUD(DbgPrint("BytesProcessed != sizeof(PacketFilter), BytesProcessed = %x, sizeof(PacketFilter) = %x\n", BytesProcessed, sizeof(PacketFilter));)
+		IF_LOUD(DbgPrint("BytesProcessed != sizeof(PacketFilter), BytesProcessed = %#lx, sizeof(PacketFilter) = %#zx\n", BytesProcessed, sizeof(PacketFilter));)
 		Status = NDIS_STATUS_FAILURE;
 	}
 	return Status;
@@ -3372,11 +3380,9 @@ NDIS_STATUS NPF_DoInternalRequest(
 	INTERNAL_REQUEST            FilterRequest;
 	PNDIS_OID_REQUEST           NdisRequest = &FilterRequest.Request;
 	NDIS_STATUS                 Status = NDIS_STATUS_FAILURE;
-	BOOLEAN                     bFalse;
 
 	FilterRequest.RequestStatus = NDIS_STATUS_PENDING;
 
-	bFalse = FALSE;
 	*pBytesProcessed = 0;
 	NdisZeroMemory(NdisRequest, sizeof(NDIS_OID_REQUEST));
 
@@ -3421,7 +3427,6 @@ NDIS_STATUS NPF_DoInternalRequest(
 			IF_LOUD(DbgPrint("Status = %x\n", Status);)
 			TRACE_EXIT();
 			return Status;
-			// ASSERT(bFalse);
 			// break;
 	}
 

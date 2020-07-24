@@ -122,7 +122,7 @@ NPF_Read(
 			Status = STATUS_INVALID_HANDLE;
 			break;
 		}
-		if (!NPF_StartUsingOpenInstance(Open, OpenDetached))
+		if (!NPF_StartUsingOpenInstance(Open, OpenDetached, NPF_IRQL_UNKNOWN))
 		{
 			// Instance is being closed
 			Status = STATUS_CANCELLED;
@@ -131,7 +131,7 @@ NPF_Read(
 
 		if (Open->Size == 0)
 		{
-			NPF_StopUsingOpenInstance(Open, OpenDetached);
+			NPF_StopUsingOpenInstance(Open, OpenDetached, NPF_IRQL_UNKNOWN);
 			Status = STATUS_UNSUCCESSFUL;
 			break;
 		}
@@ -140,7 +140,7 @@ NPF_Read(
 		if (Open->mode & MODE_DUMP && Open->DumpFileHandle == NULL)
 		{
 			// this instance is in dump mode, but the dump file has still not been opened
-			NPF_StopUsingOpenInstance(Open, OpenDetached);
+			NPF_StopUsingOpenInstance(Open, OpenDetached, NPF_IRQL_UNKNOWN);
 			Status = STATUS_UNSUCCESSFUL;
 			break;
 		}
@@ -181,7 +181,7 @@ NPF_Read(
 
 			if (CurrBuff == NULL)
 			{
-				NPF_StopUsingOpenInstance(Open, OpenDetached);
+				NPF_StopUsingOpenInstance(Open, OpenDetached, NPF_IRQL_UNKNOWN);
 				TRACE_EXIT();
 				EXIT_FAILURE(0);
 			}
@@ -190,7 +190,7 @@ NPF_Read(
 			{
 				if (IrpSp->Parameters.Read.Length < sizeof(struct bpf_hdr) + 24)
 				{
-					NPF_StopUsingOpenInstance(Open, OpenDetached);
+					NPF_StopUsingOpenInstance(Open, OpenDetached, NPF_IRQL_UNKNOWN);
 					Irp->IoStatus.Status = STATUS_BUFFER_TOO_SMALL;
 					IoCompleteRequest(Irp, IO_NO_INCREMENT);
 					TRACE_EXIT();
@@ -201,7 +201,7 @@ NPF_Read(
 			{
 				if (IrpSp->Parameters.Read.Length < sizeof(struct bpf_hdr) + 16)
 				{
-					NPF_StopUsingOpenInstance(Open, OpenDetached);
+					NPF_StopUsingOpenInstance(Open, OpenDetached, NPF_IRQL_UNKNOWN);
 					Irp->IoStatus.Status = STATUS_BUFFER_TOO_SMALL;
 					IoCompleteRequest(Irp, IO_NO_INCREMENT);
 					TRACE_EXIT();
@@ -234,12 +234,12 @@ NPF_Read(
 			*(LONGLONG *) (CurrBuff + sizeof(struct bpf_hdr) + 8) = Open->Nbytes.QuadPart;
 
 			//reset the countetrs
-			NdisAcquireSpinLock(&Open->CountersLock);
+			FILTER_ACQUIRE_LOCK(&Open->CountersLock, NPF_IRQL_UNKNOWN);
 			Open->Npackets.QuadPart = 0;
 			Open->Nbytes.QuadPart = 0;
-			NdisReleaseSpinLock(&Open->CountersLock);
+			FILTER_RELEASE_LOCK(&Open->CountersLock, NPF_IRQL_UNKNOWN);
 
-			NPF_StopUsingOpenInstance(Open, OpenDetached);
+			NPF_StopUsingOpenInstance(Open, OpenDetached, NPF_IRQL_UNKNOWN);
 
 			Irp->IoStatus.Status = STATUS_SUCCESS;
 			IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -254,7 +254,7 @@ NPF_Read(
 		//
 		if (Open->mode == MODE_MON)   //this capture instance is in monitor mode
 		{
-			NPF_StopUsingOpenInstance(Open, OpenDetached);
+			NPF_StopUsingOpenInstance(Open, OpenDetached, NPF_IRQL_UNKNOWN);
 			TRACE_EXIT();
 			EXIT_FAILURE(0);
 		}
@@ -268,7 +268,7 @@ NPF_Read(
 
 	if (Irp->MdlAddress == 0x0)
 	{
-		NPF_StopUsingOpenInstance(Open, OpenDetached);
+		NPF_StopUsingOpenInstance(Open, OpenDetached, NPF_IRQL_UNKNOWN);
 		TRACE_EXIT();
 		EXIT_FAILURE(0);
 	}
@@ -278,7 +278,7 @@ NPF_Read(
 
 	if (packp == NULL)
 	{
-		NPF_StopUsingOpenInstance(Open, OpenDetached);
+		NPF_StopUsingOpenInstance(Open, OpenDetached, NPF_IRQL_UNKNOWN);
 		TRACE_EXIT();
 		EXIT_FAILURE(0);
 	}
@@ -286,13 +286,30 @@ NPF_Read(
 	if (Open->ReadEvent != NULL)
 		KeClearEvent(Open->ReadEvent);
 
+	// "NdisAcquireRWLockRead always raises the IRQL to IRQL = DISPATCH_LEVEL"
 	NdisAcquireRWLockRead(Open->BufferLock, &lockState, 0);
 
 	while (available > copied && Open->Free < Open->Size)
 	{
 		//there are some packets in the buffer
 		PLIST_ENTRY pCapDataEntry = ExInterlockedRemoveHeadList(&Open->PacketQueue, &Open->PacketQueueLock);
+		if (pCapDataEntry == NULL)
+		{
+			/* No packets in queue. Maybe someone else is calling NPF_Read?
+			* This was reported as a crash (null ptr deref) 2 lines down, but I can't see a reason for it
+			* unless compiler is reordering calls such that Open->Free is decremented before the packet is
+			* put in the queue down in TEFEO.  We could continue here to try to get more packets, but if
+			* it's an actual accounting bug, we'd get infite loop hangs. I'd rather break and see Read calls
+			* returning no or few packets and eventually unexplained packet drops.
+			*/
+			break;
+		}
 		PNPF_CAP_DATA pCapData = CONTAINING_RECORD(pCapDataEntry, NPF_CAP_DATA, PacketQueueEntry);
+
+		/* Any NPF_CAP_DATA in the queue must be initialized and point to valid data. */
+		ASSERT(pCapData->pNBCopy);
+		ASSERT(pCapData->pNBCopy->pNBLCopy);
+		ASSERT(pCapData->pNBCopy->pNetBuffer);
 
 #ifdef HAVE_DOT11_SUPPORT
 		PIEEE80211_RADIOTAP_HEADER pRadiotapHeader = (PIEEE80211_RADIOTAP_HEADER) pCapData->pNBCopy->pNBLCopy->Dot11RadiotapHeader;
@@ -360,13 +377,13 @@ NPF_Read(
 		InterlockedExchangeAdd(&Open->Free, NPF_CAP_SIZE(pCapData, pRadiotapHeader));
 
 		// Return this capture data
-		NPF_ObjectPoolReturn(pCapData, NPF_FreeCapData);
+		NPF_ObjectPoolReturn(pCapData, NPF_FreeCapData, TRUE);
 
 		ASSERT(Open->Free <= Open->Size);
 	}
 
 	NdisReleaseRWLock(Open->BufferLock, &lockState);
-	NPF_StopUsingOpenInstance(Open, OpenDetached);
+	NPF_StopUsingOpenInstance(Open, OpenDetached, NPF_IRQL_UNKNOWN);
 
 	if (copied == 0 && Open->OpenStatus == OpenDetached)
 	{
@@ -422,7 +439,8 @@ NPF_DoTap(
 			// If this instance originated the packet and doesn't want to see it, don't capture.
 			if (!(TempOpen == pOpenOriginating && TempOpen->SkipSentPackets))
 			{
-				NPF_TapExForEachOpen(TempOpen, NetBufferLists, &NBLCopiesHead, &tstamp, AtDispatchLevel);
+				// NdisAcquireRWLockRead above raised to DISPATCH_LEVEL
+				NPF_TapExForEachOpen(TempOpen, NetBufferLists, &NBLCopiesHead, &tstamp, TRUE);
 			}
 		}
 	}
@@ -432,7 +450,7 @@ NPF_DoTap(
 	for (Curr = NBLCopiesHead.Next; Curr != NULL; Curr = Curr->Next)
 	{
 		pNBLCopy = CONTAINING_RECORD(Curr, NPF_NBL_COPY, NBLCopyEntry); 
-		NPF_ObjectPoolReturn(pNBLCopy, NPF_FreeNBLCopy);
+		NPF_ObjectPoolReturn(pNBLCopy, NPF_FreeNBLCopy, AtDispatchLevel);
 	}
 
 	return;
@@ -575,7 +593,7 @@ NPF_TapExForEachOpen(
 	
 	//TRACE_ENTER();
 
-	if (!NPF_StartUsingOpenInstance(Open, OpenRunning))
+	if (!NPF_StartUsingOpenInstance(Open, OpenRunning, AtDispatchLevel))
  	{
  		// The adapter is in use or even released, stop the tapping.
  		return;
@@ -595,7 +613,7 @@ NPF_TapExForEachOpen(
 		if (pNBLCopyPrev->Next == NULL)
 		{
 			// Add another NBL copy to the chain
-			pNBLCopy = (PNPF_NBL_COPY) NPF_ObjectPoolGet(Open->DeviceExtension->NBLCopyPool);
+			pNBLCopy = (PNPF_NBL_COPY) NPF_ObjectPoolGet(Open->DeviceExtension->NBLCopyPool, AtDispatchLevel);
 			if (pNBLCopy == NULL)
 			{
 				//Insufficient resources.
@@ -603,7 +621,6 @@ NPF_TapExForEachOpen(
 				// and actual NBs won't line up.
 				goto TEFEO_done_with_NBs;
 			}
-			RtlZeroMemory(pNBLCopy, sizeof(NPF_NBL_COPY));
 			pNBLCopyPrev->Next = &pNBLCopy->NBLCopyEntry;
 		}
 		else
@@ -653,14 +670,13 @@ NPF_TapExForEachOpen(
 					goto RadiotapDone;
 				}
 
-				pNBLCopy->Dot11RadiotapHeader = (PUCHAR) NPF_ObjectPoolGet(Open->DeviceExtension->Dot11HeaderPool);
+				pNBLCopy->Dot11RadiotapHeader = (PUCHAR) NPF_ObjectPoolGet(Open->DeviceExtension->Dot11HeaderPool, AtDispatchLevel);
 				if (pNBLCopy->Dot11RadiotapHeader == NULL)
 				{
 					// Insufficient memory
 					// TODO: Count this as a drop?
 					goto RadiotapDone;
 				}
-				RtlZeroMemory(pNBLCopy->Dot11RadiotapHeader, SIZEOF_RADIOTAP_BUFFER);
 				pRadiotapHeader = (PIEEE80211_RADIOTAP_HEADER) pNBLCopy->Dot11RadiotapHeader;
 
 				// The radiotap header is also placed in the buffer.
@@ -817,7 +833,7 @@ NPF_TapExForEachOpen(
 			if (pNBCopiesPrev->Next == NULL)
 			{
 				// Add another copy to the chain
-				pNBCopy = (PNPF_NB_COPIES) NPF_ObjectPoolGet(Open->DeviceExtension->NBCopiesPool);
+				pNBCopy = (PNPF_NB_COPIES) NPF_ObjectPoolGet(Open->DeviceExtension->NBCopiesPool, AtDispatchLevel);
 				if (pNBCopy == NULL)
 				{
 					//Insufficient resources.
@@ -825,7 +841,6 @@ NPF_TapExForEachOpen(
 					// and actual NBs won't line up.
 					goto TEFEO_done_with_NBs;
 				}
-				RtlZeroMemory(pNBCopy, sizeof(NPF_NB_COPIES));
 				pNBCopiesPrev->Next = &pNBCopy->CopiesEntry;
 				pNBCopy->pNBLCopy = pNBLCopy;
 			}
@@ -839,7 +854,8 @@ NPF_TapExForEachOpen(
 			received++;
 
 			// Lock BPF engine for reading.
-			NdisAcquireRWLockRead(Open->MachineLock, &lockState, 0);
+			NdisAcquireRWLockRead(Open->MachineLock, &lockState,
+					AtDispatchLevel ? NDIS_RWL_AT_DISPATCH_LEVEL : 0);
 
 			// Get the whole packet length.
 			TotalPacketSize = NET_BUFFER_DATA_LENGTH(pNetBuf);
@@ -866,7 +882,7 @@ NPF_TapExForEachOpen(
 			if (Open->mode & MODE_STAT)
 			{
 				// we are in statistics mode
-				NdisAcquireSpinLock(&Open->CountersLock);
+				FILTER_ACQUIRE_LOCK(&Open->CountersLock, AtDispatchLevel);
 
 				Open->Npackets.QuadPart++;
 
@@ -878,7 +894,7 @@ NPF_TapExForEachOpen(
 				// these values must be considered because are not part of the packet received from NDIS
 				Open->Nbytes.QuadPart += 12;
 
-				NdisReleaseSpinLock(&Open->CountersLock);
+				FILTER_RELEASE_LOCK(&Open->CountersLock, AtDispatchLevel);
 
 				if (!(Open->mode & MODE_DUMP))
 				{
@@ -907,7 +923,8 @@ NPF_TapExForEachOpen(
 			}
 #endif
 			// Lock "buffer" whenever checking Size/Free
-			NdisAcquireRWLockRead(Open->BufferLock, &lockState, 0);
+			NdisAcquireRWLockRead(Open->BufferLock, &lockState,
+					AtDispatchLevel ? NDIS_RWL_AT_DISPATCH_LEVEL : 0);
 			if (Open->Size == 0)
 			{
 				dropped++;
@@ -996,7 +1013,8 @@ NPF_TapExForEachOpen(
 				NET_BUFFER_DATA_LENGTH(pNBCopy->pNetBuffer) = fres;
 			}
 
-			PNPF_CAP_DATA pCapData = (PNPF_CAP_DATA) NPF_ObjectPoolGet(Open->CapturePool);
+			// While BufferLock is held we are at DISPATCH_LEVEL
+			PNPF_CAP_DATA pCapData = (PNPF_CAP_DATA) NPF_ObjectPoolGet(Open->CapturePool, TRUE);
 			if (pCapData == NULL)
 			{
 				// Insufficient memory
@@ -1004,7 +1022,6 @@ NPF_TapExForEachOpen(
 				dropped++;
 				goto TEFEO_release_BufferLock;
 			}
-			RtlZeroMemory(pCapData, sizeof(NPF_CAP_DATA));
 			// Increment refcounts on relevant structures
 			pCapData->pNBCopy = pNBCopy;
 			NPF_ReferenceObject(pNBCopy);
@@ -1020,6 +1037,15 @@ NPF_TapExForEachOpen(
 			pCapData->BpfHeader.bh_caplen = fres;
 			pCapData->BpfHeader.bh_datalen = TotalPacketSize;
 			pCapData->BpfHeader.bh_hdrlen = sizeof(struct bpf_hdr);
+			// We need to be sure that pCapData is completely
+			// populated before we put it in the queue, since
+			// NPF_Read could pull it out of the queue immediately
+			// afterwards.
+			KeMemoryBarrier();
+			/* Any NPF_CAP_DATA in the queue must be initialized and point to valid data. */
+			ASSERT(pCapData->pNBCopy);
+			ASSERT(pCapData->pNBCopy->pNBLCopy);
+			ASSERT(pCapData->pNBCopy->pNetBuffer);
 			ExInterlockedInsertTailList(&Open->PacketQueue, &pCapData->PacketQueueEntry, &Open->PacketQueueLock);
 
 			InterlockedExchangeAdd(&Open->Free, -(LONG)NPF_CAP_SIZE(pCapData, pRadiotapHeader));
@@ -1060,6 +1086,6 @@ TEFEO_done_with_NBs:
 
 	InterlockedExchangeAdd(&Open->Dropped, dropped);
 	InterlockedExchangeAdd(&Open->Received, received);
-	NPF_StopUsingOpenInstance(Open, OpenRunning);
+	NPF_StopUsingOpenInstance(Open, OpenRunning, AtDispatchLevel);
 	//TRACE_EXIT();
 }

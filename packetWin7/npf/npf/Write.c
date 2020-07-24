@@ -101,6 +101,7 @@ NPF_FreePackets(
   Callback function associated with the NdisFSend() NDIS function. It is invoked by NPF_SendCompleteEx() when the NIC
   driver has finished an OID request operation that was previously started by NPF_Write().
 */
+_IRQL_requires_min_(DISPATCH_LEVEL)
 VOID
 NPF_SendCompleteExForEachOpen(
 	_In_ POPEN_INSTANCE Open,
@@ -153,7 +154,7 @@ NPF_Write(
 		return STATUS_INVALID_HANDLE;
 	}
 
-	if (!NPF_StartUsingOpenInstance(Open, OpenRunning))
+	if (!NPF_StartUsingOpenInstance(Open, OpenRunning, NPF_IRQL_UNKNOWN))
 	{
 		// Write requires an attached adapter.
 		Irp->IoStatus.Information = 0;
@@ -172,7 +173,7 @@ NPF_Write(
 	//
 	if (NumSends == 0)
 	{
-		NPF_StopUsingOpenInstance(Open, OpenRunning);
+		NPF_StopUsingOpenInstance(Open, OpenRunning, NPF_IRQL_UNKNOWN);
 		Irp->IoStatus.Information = 0;
 		Irp->IoStatus.Status = STATUS_SUCCESS;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -193,7 +194,7 @@ NPF_Write(
 	{
 		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "Write parameters empty. Send aborted");
 
-		NPF_StopUsingOpenInstance(Open, OpenRunning);
+		NPF_StopUsingOpenInstance(Open, OpenRunning, NPF_IRQL_UNKNOWN);
 
 		Irp->IoStatus.Information = 0;
 		Irp->IoStatus.Status = STATUS_UNSUCCESSFUL;
@@ -210,7 +211,7 @@ NPF_Write(
 	{
 		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "Adapter is probably unbinding, cannot send packets");
 
-		NPF_StopUsingOpenInstance(Open, OpenRunning);
+		NPF_StopUsingOpenInstance(Open, OpenRunning, NPF_IRQL_UNKNOWN);
 
 		Irp->IoStatus.Information = 0;
 		Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
@@ -226,7 +227,7 @@ NPF_Write(
 	{
 		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "Frame size out of range, or maxFrameSize = 0. Send aborted");
 
-		NPF_StopUsingOpenInstance(Open, OpenRunning);
+		NPF_StopUsingOpenInstance(Open, OpenRunning, NPF_IRQL_UNKNOWN);
 
 		Irp->IoStatus.Information = 0;
 		Irp->IoStatus.Status = STATUS_UNSUCCESSFUL;
@@ -245,7 +246,7 @@ NPF_Write(
 
 		TRACE_MESSAGE(PACKET_DEBUG_LOUD, "Another Send operation is in progress, aborting.");
 
-		NPF_StopUsingOpenInstance(Open, OpenRunning);
+		NPF_StopUsingOpenInstance(Open, OpenRunning, NPF_IRQL_UNKNOWN);
 
 		Irp->IoStatus.Information = 0;
 		Irp->IoStatus.Status = STATUS_DEVICE_BUSY;
@@ -320,7 +321,7 @@ NPF_Write(
 			if (Open->pFiltMod->Loopback == FALSE)
 			{
 #endif
-				NPF_DoTap(Open->pFiltMod, pNetBufferList, Open, FALSE);
+				NPF_DoTap(Open->pFiltMod, pNetBufferList, Open, NPF_IRQL_UNKNOWN);
 #ifdef HAVE_WFP_LOOPBACK_SUPPORT
 			}
 #endif
@@ -436,7 +437,7 @@ NPF_Write(
 	Open->WriteInProgress = FALSE;
 	NdisReleaseSpinLock(&Open->WriteLock);
 
-	NPF_StopUsingOpenInstance(Open, OpenRunning);
+	NPF_StopUsingOpenInstance(Open, OpenRunning, NPF_IRQL_UNKNOWN);
 
 	//
 	// Complete the Irp and return success
@@ -692,7 +693,7 @@ NPF_BufferedWrite(
 
 		//receive the packets before sending them
 		// TODO: Should we check for loopback like we do in NPF_Write?
-		NPF_DoTap(Open->pFiltMod, pNetBufferList, Open, FALSE);
+		NPF_DoTap(Open->pFiltMod, pNetBufferList, Open, NPF_IRQL_UNKNOWN);
 
 		pNetBufferList->SourceHandle = Open->pFiltMod->AdapterHandle;
 		RESERVED(pNetBufferList)->ChildOpen = Open; //save the child open object in the packets
@@ -969,7 +970,7 @@ NPF_SendCompleteExForEachOpen(
 {
 	//TRACE_ENTER();
 
-	NdisAcquireSpinLock(&Open->OpenInUseLock);
+	FILTER_ACQUIRE_LOCK(&Open->OpenInUseLock, TRUE);
 
 	if (FreeBufAfterWrite)
 	{
@@ -1014,7 +1015,7 @@ NPF_SendCompleteExForEachOpen(
 		//TRACE_EXIT();
 	}
 
-	NdisReleaseSpinLock(&Open->OpenInUseLock);
+	FILTER_RELEASE_LOCK(&Open->OpenInUseLock, TRUE);
 }
 
 //-------------------------------------------------------------------
