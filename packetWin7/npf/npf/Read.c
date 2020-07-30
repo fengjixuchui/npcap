@@ -316,7 +316,7 @@ NPF_Read(
 #else
 		PVOID pRadiotapHeader = NULL;
 #endif
-		plen = pCapData->BpfHeader.bh_caplen;
+		plen = pCapData->ulCaplen;
 
 		if (NPF_CAP_SIZE(pCapData, pRadiotapHeader) > available - copied)
 		{
@@ -327,7 +327,10 @@ NPF_Read(
 		}
 
 		header = (struct bpf_hdr *) (packp + copied);
-		*header = pCapData->BpfHeader;
+		header->bh_tstamp = pCapData->pNBCopy->pNBLCopy->tstamp;
+		header->bh_caplen = plen;
+		header->bh_datalen = pCapData->pNBCopy->ulPacketSize;
+		header->bh_hdrlen = sizeof(struct bpf_hdr);
 
 		copied += sizeof(struct bpf_hdr);
 
@@ -354,6 +357,12 @@ NPF_Read(
 					&pDataLinkBuffer,
 					&BufferLength,
 					NormalPagePriority);
+			if (pDataLinkBuffer == NULL)
+			{
+				IF_LOUD(DbgPrint("Unable to query MDL; bailing.");)
+				pMdl = NULL;
+				break;
+			}
 
 			CopyLengthForMDL = min(plen, BufferLength);
 
@@ -376,6 +385,14 @@ NPF_Read(
 		// Increase free space by the amount that it was reduced before
 		InterlockedExchangeAdd(&Open->Free, NPF_CAP_SIZE(pCapData, pRadiotapHeader));
 
+		// If the NBCopy has data buffers, refcount it and push it onto the cache stack
+		if (pCapData->pNBCopy->ulSize > NPF_NBCOPY_INITIAL_DATA_SIZE)
+		{
+			NPF_ReferenceObject(pCapData->pNBCopy);
+			ExInterlockedPushEntryList(&Open->DeviceExtension->NBCopiesCache,
+					&pCapData->pNBCopy->CopiesEntry,
+					&Open->DeviceExtension->NBCopiesCacheLock);
+		}
 		// Return this capture data
 		NPF_ObjectPoolReturn(pCapData, NPF_FreeCapData, TRUE);
 
@@ -563,6 +580,56 @@ NPF_AlignProtocolField(
 	*pCur = *pCur - *pCur % Alignment;
 }
 
+// Keep a stack of NPF_NB_COPIES objects with data buffers attached (larger packets).
+PNPF_NB_COPIES NPF_GetNBCopy(
+		_In_ POPEN_INSTANCE pOpen,
+		_In_ ULONG ulSize,
+		_In_ BOOLEAN bAtDispatchLevel
+		)
+{
+	PDEVICE_EXTENSION pDevExt = pOpen->DeviceExtension;
+	PSINGLE_LIST_ENTRY pCopiesEntry = NULL;
+	PNPF_NB_COPIES pNBCopy = NULL;
+	PNET_BUFFER pNetBuffer = NULL;
+
+	if (ulSize >= NPF_NBCOPY_INITIAL_DATA_SIZE)
+	{
+		pCopiesEntry = ExInterlockedPopEntryList(&pDevExt->NBCopiesCache, &pDevExt->NBCopiesCacheLock);
+	}
+
+	if (pCopiesEntry == NULL)
+	{
+		pNBCopy = (PNPF_NB_COPIES) NPF_ObjectPoolGet(pDevExt->NBCopiesPool, bAtDispatchLevel);
+		if (pNBCopy == NULL)
+		{
+			return NULL;
+		}
+	}
+	else
+	{
+		pNBCopy = CONTAINING_RECORD(pCopiesEntry, NPF_NB_COPIES, CopiesEntry);
+	}
+
+	pNetBuffer = pNBCopy->pNetBuffer;
+
+	if (!pNetBuffer)
+	{
+		pNetBuffer = NdisAllocateNetBufferMdlAndData(pOpen->pFiltMod->TapNBPool);
+		if (pNetBuffer == NULL)
+		{
+			NPF_ObjectPoolReturn(pNBCopy, NPF_FreeNBCopies, bAtDispatchLevel);
+			return NULL;
+		}
+		pNBCopy->ulSize = NPF_NBCOPY_INITIAL_DATA_SIZE;
+		pNBCopy->pNetBuffer = pNetBuffer;
+	}
+
+	NET_BUFFER_DATA_OFFSET(pNetBuffer) = 0;
+	NET_BUFFER_DATA_LENGTH(pNetBuffer) = 0;
+	NdisAdjustNetBufferCurrentMdl(pNetBuffer);
+	return pNBCopy;
+}
+
 //-------------------------------------------------------------------
 
 _Use_decl_annotations_
@@ -622,6 +689,13 @@ NPF_TapExForEachOpen(
 				goto TEFEO_done_with_NBs;
 			}
 			pNBLCopyPrev->Next = &pNBLCopy->NBLCopyEntry;
+			if (tstamp->tv_sec == 0)
+			{
+				// We only get the timestamp once for all packets in this set of NBLs
+				// since they were all delivered at the same time.
+				GET_TIME(tstamp, &Open->start, Open->TimestampMode);
+			}
+			pNBLCopy->tstamp = *tstamp;
 		}
 		else
 		{
@@ -830,43 +904,25 @@ NPF_TapExForEachOpen(
 		pNBCopiesPrev = &pNBLCopy->NBCopiesHead;
 		while (pNetBuf != NULL)
 		{
-			if (pNBCopiesPrev->Next == NULL)
-			{
-				// Add another copy to the chain
-				pNBCopy = (PNPF_NB_COPIES) NPF_ObjectPoolGet(Open->DeviceExtension->NBCopiesPool, AtDispatchLevel);
-				if (pNBCopy == NULL)
-				{
-					//Insufficient resources.
-					// We can't continue traversing or the NBCopies
-					// and actual NBs won't line up.
-					goto TEFEO_done_with_NBs;
-				}
-				pNBCopiesPrev->Next = &pNBCopy->CopiesEntry;
-				pNBCopy->pNBLCopy = pNBLCopy;
-			}
-			else
-			{
-				pNBCopy = CONTAINING_RECORD(pNBCopiesPrev->Next, NPF_NB_COPIES, CopiesEntry);
-			}
-			pNBCopiesPrev = pNBCopiesPrev->Next;
 			pNextNetBuf = NET_BUFFER_NEXT_NB(pNetBuf);
 
 			received++;
+
+			// Get the whole packet length.
+			TotalPacketSize = NET_BUFFER_DATA_LENGTH(pNetBuf);
 
 			// Lock BPF engine for reading.
 			NdisAcquireRWLockRead(Open->MachineLock, &lockState,
 					AtDispatchLevel ? NDIS_RWL_AT_DISPATCH_LEVEL : 0);
 
-			// Get the whole packet length.
-			TotalPacketSize = NET_BUFFER_DATA_LENGTH(pNetBuf);
-
 			fres = bpf_filter((struct bpf_insn *)(Open->bpfprogram),
 					NET_BUFFER_CURRENT_MDL(pNetBuf),
 					NET_BUFFER_CURRENT_MDL_OFFSET(pNetBuf),
 					TotalPacketSize);
-			IF_LOUD(DbgPrint("\nCurrent MDL length = %d, Packet Size = %d, fres = %d\n", MmGetMdlByteCount(NET_BUFFER_CURRENT_MDL(pNetBuf)), TotalPacketSize, fres);)
 
 			NdisReleaseRWLock(Open->MachineLock, &lockState);
+
+			IF_LOUD(DbgPrint("\nCurrent MDL length = %d, Packet Size = %d, fres = %d\n", MmGetMdlByteCount(NET_BUFFER_CURRENT_MDL(pNetBuf)), TotalPacketSize, fres);)
 
 			if (fres == 0)
 			{
@@ -950,6 +1006,29 @@ NPF_TapExForEachOpen(
 
 			// Packet accepted and must be written to buffer.
 			// Make a copy of the data so we can return the original quickly,
+			if (pNBCopiesPrev->Next == NULL)
+			{
+				// Add another copy to the chain
+				// While BufferLock is held we are at DISPATCH_LEVEL
+				pNBCopy = NPF_GetNBCopy(Open, fres, TRUE);
+				if (pNBCopy == NULL)
+				{
+					//Insufficient resources.
+					// We can't continue traversing or the NBCopies
+					// and actual NBs won't line up.
+					dropped++;
+					NdisReleaseRWLock(Open->BufferLock, &lockState);
+					goto TEFEO_done_with_NBs;
+				}
+				pNBCopiesPrev->Next = &pNBCopy->CopiesEntry;
+				pNBCopy->pNBLCopy = pNBLCopy;
+				pNBCopy->ulPacketSize = NET_BUFFER_DATA_LENGTH(pNetBuf);
+			}
+			else
+			{
+				pNBCopy = CONTAINING_RECORD(pNBCopiesPrev->Next, NPF_NB_COPIES, CopiesEntry);
+			}
+
 			if (pNBCopy->pNetBuffer == NULL)
 			{
 				pNBCopy->pNetBuffer = NdisAllocateNetBufferMdlAndData(Open->pFiltMod->TapNBPool);
@@ -980,7 +1059,7 @@ NPF_TapExForEachOpen(
 					PUCHAR pBuff = (PUCHAR) NdisAllocateMemoryWithTagPriority(
 						Open->pFiltMod->AdapterHandle,
 						toAlloc,
-						NPF_ALLOC_TAG,
+						NPF_PACKET_DATA_TAG,
 						NormalPoolPriority);
 					if (pBuff == NULL)
 					{
@@ -1027,16 +1106,7 @@ NPF_TapExForEachOpen(
 			NPF_ReferenceObject(pNBCopy);
 			NPF_ReferenceObject(pNBLCopy);
 
-			if (tstamp->tv_sec == 0)
-			{
-				// We only get the timestamp once for all packets in this set of NBLs
-				// since they were all delivered at the same time.
-				GET_TIME(tstamp, &Open->start, Open->TimestampMode);
-			}
-			pCapData->BpfHeader.bh_tstamp = *tstamp;
-			pCapData->BpfHeader.bh_caplen = fres;
-			pCapData->BpfHeader.bh_datalen = TotalPacketSize;
-			pCapData->BpfHeader.bh_hdrlen = sizeof(struct bpf_hdr);
+			pCapData->ulCaplen = fres;
 			// We need to be sure that pCapData is completely
 			// populated before we put it in the queue, since
 			// NPF_Read could pull it out of the queue immediately
@@ -1069,6 +1139,22 @@ TEFEO_release_BufferLock:
 			NdisReleaseRWLock(Open->BufferLock, &lockState);
 
 TEFEO_next_NB:
+			if (pNBCopy == NULL && pNBCopiesPrev->Next == NULL)
+			{
+				// We bailed early and we still need a placeholder NBCopies here.
+				pNBCopy = (PNPF_NB_COPIES) NPF_ObjectPoolGet(Open->DeviceExtension->NBCopiesPool, AtDispatchLevel);
+				if (pNBCopy == NULL)
+				{
+					//Insufficient resources.
+					// We can't continue traversing or the NBCopies
+					// and actual NBs won't line up.
+					goto TEFEO_done_with_NBs;
+				}
+				pNBCopiesPrev->Next = &pNBCopy->CopiesEntry;
+				pNBCopy->pNBLCopy = pNBLCopy;
+				pNBCopy->ulPacketSize = NET_BUFFER_DATA_LENGTH(pNetBuf);
+			}
+			pNBCopiesPrev = pNBCopiesPrev->Next;
 			pNetBuf = pNextNetBuf;
 		} // while (pNetBuf != NULL)
 

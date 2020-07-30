@@ -218,6 +218,59 @@ NPF_GetRegistryOption_String(
 	_Inout_ PNDIS_STRING g_OutputString
 	);
 
+VOID
+NPF_GCThread(_In_ PVOID Context)
+{
+	PDEVICE_EXTENSION pDevExt = Context;
+	PSINGLE_LIST_ENTRY pCopiesEntry = NULL;
+
+	KeSetPriorityThread(KeGetCurrentThread(), LOW_REALTIME_PRIORITY );
+
+	for (;;)
+	{
+		// Wait for work to appear
+		KeWaitForSingleObject(&pDevExt->GCSemaphore,
+				Executive,
+				KernelMode,
+				FALSE,
+				NULL);
+		// Check if we're being told to die
+		if (pDevExt->GCShouldStop) {
+			PsTerminateSystemThread( STATUS_SUCCESS );
+		}
+
+		// First clear the copies cache if it's not needed
+		// We check AllOpens constantly so that if a new handle is
+		// opened there will still be some copies in the cache.
+		while (IsListEmpty(&pDevExt->AllOpens))
+		{
+			pCopiesEntry = ExInterlockedPopEntryList(&pDevExt->NBCopiesCache, &pDevExt->NBCopiesCacheLock);
+			if (pCopiesEntry == NULL)
+			{
+				break;
+			}
+			NPF_ObjectPoolReturn(CONTAINING_RECORD(pCopiesEntry, NPF_NB_COPIES, CopiesEntry),
+					NPF_FreeNBCopies, FALSE);
+		}
+
+		// Now shrink the pools if need be.
+		if (pDevExt->NBLCopyPool)
+		{
+			NPF_ShrinkObjectPool(pDevExt->NBLCopyPool);
+		}
+		if (pDevExt->NBCopiesPool)
+		{
+			NPF_ShrinkObjectPool(pDevExt->NBCopiesPool);
+		}
+#ifdef HAVE_DOT11_SUPPORT
+		if (pDevExt->Dot11HeaderPool)
+		{
+			NPF_ShrinkObjectPool(pDevExt->Dot11HeaderPool);
+		}
+#endif
+	}
+}
+
 //-------------------------------------------------------------------
 //
 //  Packet Driver's entry routine.
@@ -259,7 +312,7 @@ DriverEntry(
 
 	RtlInitUnicodeString(&parametersPath, NULL);
 	parametersPath.MaximumLength=RegistryPath->Length+wcslen(L"\\Parameters")*sizeof(WCHAR)+sizeof(UNICODE_NULL);
-	parametersPath.Buffer=ExAllocatePoolWithTag(PagedPool, parametersPath.MaximumLength, '4PWA');
+	parametersPath.Buffer=ExAllocatePoolWithTag(PagedPool, parametersPath.MaximumLength, NPF_UNICODE_BUFFER_TAG);
 	if (!parametersPath.Buffer) {
 		return STATUS_INSUFFICIENT_RESOURCES;
 	}
@@ -381,7 +434,7 @@ DriverEntry(
 	deviceSymLink.Length = 0;
 	deviceSymLink.MaximumLength = (USHORT)(AdapterName.Length - devicePrefix.Length + symbolicLinkPrefix.Length + sizeof(UNICODE_NULL));
 
-	deviceSymLink.Buffer = ExAllocatePoolWithTag(NonPagedPool, deviceSymLink.MaximumLength, '3PWA');
+	deviceSymLink.Buffer = ExAllocatePoolWithTag(NonPagedPool, deviceSymLink.MaximumLength, NPF_UNICODE_BUFFER_TAG);
 	if (deviceSymLink.Buffer == NULL)
 	{
 		TRACE_EXIT();
@@ -493,6 +546,41 @@ DriverEntry(
 		TRACE_EXIT();
 		return STATUS_INSUFFICIENT_RESOURCES;
 	}
+
+	devExtP->NBCopiesCache.Next = NULL;
+	KeInitializeSpinLock(&devExtP->NBCopiesCacheLock);
+
+	KeInitializeSemaphore(&devExtP->GCSemaphore, 0, MAXLONG);
+	devExtP->GCShouldStop = FALSE;
+	devExtP->GCThreadObj = NULL;
+
+	Status = PsCreateSystemThread(&threadHandle, THREAD_ALL_ACCESS,
+			NULL, NULL, NULL, NPF_GCThread, devExtP);
+	if (Status != STATUS_SUCCESS)
+	{
+		IF_LOUD(DbgPrint("PsCreateSystemThread: error, Status=%x.\n", Status);)
+		NPF_FreeObjectPool(devExtP->NBCopiesPool);
+		NPF_FreeObjectPool(devExtP->NBLCopyPool);
+		NdisFreeRWLock(devExtP->AllOpensLock);
+		NdisFDeregisterFilterDriver(FilterDriverHandle);
+		IoDeleteSymbolicLink(&deviceSymLink);
+		IoDeleteDevice(devObjP);
+		ExFreePool(deviceSymLink.Buffer);
+		devExtP->ExportString = NULL;
+
+		TRACE_EXIT();
+		return Status;
+	}
+
+	// Convert the Thread object handle into a pointer to the Thread object
+	// itself. Then close the handle.
+	ObReferenceObjectByHandle(threadHandle,
+		THREAD_ALL_ACCESS,
+		NULL,
+		KernelMode,
+		&devExtP->GCThreadObj,
+		NULL);
+	ZwClose(threadHandle);
 
 #ifdef HAVE_DOT11_SUPPORT
 	if (g_Dot11SupportMode)
@@ -733,7 +821,7 @@ REGISTRY_QUERY_VALUE_KEY:
 		{
 			// We know how big it needs to be.
 			ULONG valueInfoLength = valueInfo.DataLength + FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data[0]);
-			PKEY_VALUE_PARTIAL_INFORMATION valueInfoP = (PKEY_VALUE_PARTIAL_INFORMATION)ExAllocatePoolWithTag(PagedPool, valueInfoLength, '1PWA');
+			PKEY_VALUE_PARTIAL_INFORMATION valueInfoP = (PKEY_VALUE_PARTIAL_INFORMATION)ExAllocatePoolWithTag(PagedPool, valueInfoLength, NPF_SHORT_TERM_TAG);
 			if (valueInfoP != NULL)
 			{
 				status = ZwQueryValueKey(keyHandle,
@@ -812,7 +900,7 @@ NPF_GetRegistryOption_String(
 		{
 			// We know how big it needs to be.
 			ULONG valueInfoLength = valueInfo.DataLength + FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data[0]);
-			PKEY_VALUE_PARTIAL_INFORMATION valueInfoP = (PKEY_VALUE_PARTIAL_INFORMATION)ExAllocatePoolWithTag(PagedPool, valueInfoLength, '1PWA');
+			PKEY_VALUE_PARTIAL_INFORMATION valueInfoP = (PKEY_VALUE_PARTIAL_INFORMATION)ExAllocatePoolWithTag(PagedPool, valueInfoLength, NPF_SHORT_TERM_TAG);
 			if (valueInfoP != NULL)
 			{
 				status = ZwQueryValueKey(keyHandle,
@@ -831,7 +919,7 @@ NPF_GetRegistryOption_String(
 
 					g_OutputString->Length = (USHORT)(valueInfoP->DataLength - sizeof(UNICODE_NULL));
 					g_OutputString->MaximumLength = (USHORT)(valueInfoP->DataLength);
-					g_OutputString->Buffer = ExAllocatePoolWithTag(NonPagedPool, g_OutputString->MaximumLength, '3PWA');
+					g_OutputString->Buffer = ExAllocatePoolWithTag(NonPagedPool, g_OutputString->MaximumLength, NPF_UNICODE_BUFFER_TAG);
 
 					if (g_OutputString->Buffer)
 						RtlCopyMemory(g_OutputString->Buffer, valueInfoP->Data, valueInfoP->DataLength);
@@ -884,6 +972,8 @@ Return Value:
 	NDIS_STRING SymLink;
 	NDIS_EVENT Event;
 	LOCK_STATE_EX lockState;
+	PSINGLE_LIST_ENTRY Curr = NULL;
+	PSINGLE_LIST_ENTRY Prev = NULL;
 
 	TRACE_ENTER();
 
@@ -953,6 +1043,30 @@ Return Value:
 			}
 		}
 		NdisReleaseRWLock(DeviceExtension->AllOpensLock, &lockState);
+
+		// Stop the garbage collection thread
+		DeviceExtension->GCShouldStop = TRUE;
+		KeReleaseSemaphore(&DeviceExtension->GCSemaphore,
+				0,  // No priority boost
+				1,  // Increment semaphore by 1
+				TRUE );// WaitForXxx after this call
+		// Wait for the thread to terminate
+		KeWaitForSingleObject(DeviceExtension->GCThreadObj,
+				Executive,
+				KernelMode,
+				FALSE,
+				NULL );
+		ObDereferenceObject(DeviceExtension->GCThreadObj);
+
+		// Clear the cache
+		Prev = &DeviceExtension->NBCopiesCache;
+		Curr = Prev->Next;
+		while (Curr)
+		{
+			Prev = Curr;
+			Curr = Curr->Next;
+			NPF_ObjectPoolReturn(CONTAINING_RECORD(Prev, NPF_NB_COPIES, CopiesEntry), NPF_FreeNBCopies, FALSE);
+		}
 
 		if (DeviceExtension->ExportString)
 		{
@@ -1310,7 +1424,7 @@ NPF_IoControl(
 				}
 
 			// Allocate the memory to contain the new filter program
-			TmpBPFProgram = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, cnt * sizeof(struct bpf_insn), '4PWA');
+			TmpBPFProgram = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, cnt * sizeof(struct bpf_insn), NPF_BPF_TAG);
 			if (TmpBPFProgram == NULL)
 			{
 				TRACE_MESSAGE(PACKET_DEBUG_LOUD, "Error - No memory for filter");
@@ -1421,7 +1535,7 @@ NPF_IoControl(
 			}
 		
 			// Allocate the buffer that will contain the string
-			DumpNameBuff=ExAllocatePoolWithTag(NonPagedPool, IrpSp->Parameters.DeviceIoControl.InputBufferLength, '5PWA');
+			DumpNameBuff=ExAllocatePoolWithTag(NonPagedPool, IrpSp->Parameters.DeviceIoControl.InputBufferLength, NPF_DUMP_TAG);
 			if(DumpNameBuff==NULL || Open->DumpFileName.Buffer!=NULL){
 				IF_LOUD(DbgPrint("NPF: unable to allocate the dump filename: not enough memory or name already set\n");)
 					EXIT_FAILURE(0);
@@ -1792,7 +1906,7 @@ NPF_IoControl(
 			pRequest->Request.Header.Size = NDIS_SIZEOF_OID_REQUEST_REVISION_1;
 
 			/* NDIS_OID_REQUEST.InformationBuffer must be non-paged */
-			OidBuffer = ExAllocatePoolWithTag(NonPagedPool, OidData->Length, '0PWA');
+			OidBuffer = ExAllocatePoolWithTag(NonPagedPool, OidData->Length, NPF_USER_OID_TAG);
 			if (OidBuffer == NULL)
 			{
 				TRACE_MESSAGE(PACKET_DEBUG_LOUD, "Failed to allocate OidBuffer");
@@ -2027,7 +2141,7 @@ OID_REQUEST_DONE:
 
     if (OidBuffer != NULL)
     {
-        ExFreePoolWithTag(OidBuffer, '0PWA');
+        ExFreePoolWithTag(OidBuffer, NPF_USER_OID_TAG);
     }
 
 

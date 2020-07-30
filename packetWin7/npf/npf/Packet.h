@@ -269,9 +269,14 @@ typedef struct _DEVICE_EXTENSION
 
 	PNPF_OBJ_POOL NBLCopyPool; // Pool of NPF_NBL_COPY objects
 	PNPF_OBJ_POOL NBCopiesPool; // Pool of NPF_NB_COPIES objects
+	SINGLE_LIST_ENTRY NBCopiesCache; // Cache of initialized NPF_NB_COPIES objects
+	KSPIN_LOCK NBCopiesCacheLock;
 #ifdef HAVE_DOT11_SUPPORT
 	PNPF_OBJ_POOL Dot11HeaderPool; // Pool of Radiotap header buffers
 #endif
+	KSEMAPHORE GCSemaphore; // Semaphore to signal garbage collection thread
+	BOOLEAN GCShouldStop; // Flag to kill garbage collection thread
+	PVOID GCThreadObj; // Pointer to the garbage collection thread itself.
 } DEVICE_EXTENSION, *PDEVICE_EXTENSION;
 
 typedef enum _FILTER_STATE
@@ -437,15 +442,6 @@ typedef struct _OPEN_INSTANCE
 }
 OPEN_INSTANCE, *POPEN_INSTANCE;
 
-typedef enum
-{
-	NPF_WRITER_INVALID_CODE,
-	NPF_WRITER_WRITE,
-	NPF_WRITER_FREE_NB_COPIES,
-	NPF_WRITER_FREE_RADIOTAP,
-	NPF_WRITER_FREE_MEM,
-} NPF_WRITER_FUNCTION_CODE;
-
 /* This value should be sized to hold most packets processed by the driver. If
  * a packet (snaplen) exceeds this size, it will cost an additional buffer+MDL
  * allocation/free. On the other hand, every captured packet will use up at
@@ -458,6 +454,7 @@ typedef struct _NPF_NBL_COPY
 {
 	SINGLE_LIST_ENTRY NBCopiesHead;
 	SINGLE_LIST_ENTRY NBLCopyEntry;
+	struct timeval tstamp;
 #ifdef HAVE_DOT11_SUPPORT
 	PUCHAR Dot11RadiotapHeader;
 #endif
@@ -471,6 +468,7 @@ typedef struct _NPF_NB_COPIES
 	PNPF_NBL_COPY pNBLCopy;
 	PNET_BUFFER pNetBuffer; // May be NULL, hence why we can't just use NET_BUFFER.Next
 	ULONG ulSize; //Size of all allocated space in the netbuffer.
+	ULONG ulPacketSize; // Size of the original packet
 } NPF_NB_COPIES, *PNPF_NB_COPIES;
 
 VOID NPF_FreeNBCopies(_In_ PNPF_NB_COPIES pNBCopy, _In_ BOOLEAN bAtDispatchLevel);
@@ -480,19 +478,19 @@ typedef struct _NPF_CAP_DATA
 {
 	LIST_ENTRY PacketQueueEntry;
 	PNPF_NB_COPIES pNBCopy;
-	struct bpf_hdr BpfHeader;
+	ULONG ulCaplen;
 }
 NPF_CAP_DATA, *PNPF_CAP_DATA;
 
 VOID NPF_FreeCapData(_In_ PNPF_CAP_DATA pCapData, _In_ BOOLEAN bAtDispatchLevel);
 
 #ifdef HAVE_DOT11_SUPPORT
-#define NPF_CAP_SIZE(_P, _R) ((_P)->BpfHeader.bh_hdrlen \
-		+ (_P)->BpfHeader.bh_caplen \
+#define NPF_CAP_SIZE(_P, _R) (sizeof(struct bpf_hdr) \
+		+ (_P)->ulCaplen \
 		+ (_R != NULL ? _R->it_len : 0))
 #else
-#define NPF_CAP_SIZE(_P, _N) ((_P)->BpfHeader.bh_hdrlen \
-		+ (_P)->BpfHeader.bh_caplen)
+#define NPF_CAP_SIZE(_P, _N) (sizeof(struct bpf_hdr) \
+		+ (_P)->ulCaplen)
 #endif
 
 VOID
