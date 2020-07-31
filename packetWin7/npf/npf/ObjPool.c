@@ -48,6 +48,7 @@
  ***************************************************************************/
 #include "Packet.h"
 #include "ObjPool.h"
+#include <limits.h>
 
 typedef struct _NPF_OBJ_SHELF
 {
@@ -282,6 +283,7 @@ VOID NPF_ObjectPoolReturn(PVOID pObject, PNPF_OBJ_CLEANUP CleanupFunc, BOOLEAN b
 	PNPF_OBJ_POOL pPool = NULL;
 	PNPF_OBJ_POOL_ELEM pElem = CONTAINING_RECORD(pObject, NPF_OBJ_POOL_ELEM, pObject);
 	ULONG refcount = InterlockedDecrement(&pElem->Refcount);
+	ASSERT(refcount < ULONG_MAX);
 
 	if (refcount == 0)
 	{
@@ -294,6 +296,7 @@ VOID NPF_ObjectPoolReturn(PVOID pObject, PNPF_OBJ_CLEANUP CleanupFunc, BOOLEAN b
 		FILTER_ACQUIRE_LOCK(&pPool->ShelfLock, bAtDispatchLevel);
 
 		refcount = InterlockedDecrement(&pShelf->ulUsed);
+		ASSERT(refcount < pPool->ulIncrement);
 		if (refcount == 0)
 		{
 			// Empty shelf. Move it to the other list.

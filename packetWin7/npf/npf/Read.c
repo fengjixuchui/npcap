@@ -385,12 +385,14 @@ NPF_Read(
 		// Increase free space by the amount that it was reduced before
 		InterlockedExchangeAdd(&Open->Free, NPF_CAP_SIZE(pCapData, pRadiotapHeader));
 
-		// If the NBCopy has data buffers, refcount it and push it onto the cache stack
-		if (pCapData->pNBCopy->ulSize > NPF_NBCOPY_INITIAL_DATA_SIZE)
+		// If we are the last one using this NBCopy and it has data buffers,
+		if (0 == InterlockedDecrement(&pCapData->pNBCopy->ulRefcount)
+				&& pCapData->pNBCopy->ulSize > NPF_NBCOPY_INITIAL_DATA_SIZE)
 		{
+			// refcount it and push it onto the cache stack
 			NPF_ReferenceObject(pCapData->pNBCopy);
 			ExInterlockedPushEntryList(&Open->DeviceExtension->NBCopiesCache,
-					&pCapData->pNBCopy->CopiesEntry,
+					&pCapData->pNBCopy->CacheEntry,
 					&Open->DeviceExtension->NBCopiesCacheLock);
 		}
 		// Return this capture data
@@ -442,6 +444,8 @@ NPF_DoTap(
 	SINGLE_LIST_ENTRY NBLCopiesHead;
 	struct timeval tstamp = {0, 0};
 	NBLCopiesHead.Next = NULL;
+	PNPF_NB_COPIES pNBCopies = NULL;
+	PSINGLE_LIST_ENTRY pNBCopiesEntry = NULL;
 
 	/* Lock the group */
 	// Read-only lock since list is not being modified.
@@ -467,6 +471,14 @@ NPF_DoTap(
 	for (Curr = NBLCopiesHead.Next; Curr != NULL; Curr = Curr->Next)
 	{
 		pNBLCopy = CONTAINING_RECORD(Curr, NPF_NBL_COPY, NBLCopyEntry); 
+		pNBCopiesEntry = pNBLCopy->NBCopiesHead.Next;
+		while (pNBCopiesEntry != NULL)
+		{
+			pNBCopies = CONTAINING_RECORD(pNBCopiesEntry, NPF_NB_COPIES, CopiesEntry);
+			pNBCopiesEntry = pNBCopiesEntry->Next;
+
+			NPF_ObjectPoolReturn(pNBCopies, NPF_FreeNBCopies, AtDispatchLevel);
+		}
 		NPF_ObjectPoolReturn(pNBLCopy, NPF_FreeNBLCopy, AtDispatchLevel);
 	}
 
@@ -588,16 +600,16 @@ PNPF_NB_COPIES NPF_GetNBCopy(
 		)
 {
 	PDEVICE_EXTENSION pDevExt = pOpen->DeviceExtension;
-	PSINGLE_LIST_ENTRY pCopiesEntry = NULL;
+	PSINGLE_LIST_ENTRY pCacheEntry = NULL;
 	PNPF_NB_COPIES pNBCopy = NULL;
 	PNET_BUFFER pNetBuffer = NULL;
 
 	if (ulSize >= NPF_NBCOPY_INITIAL_DATA_SIZE)
 	{
-		pCopiesEntry = ExInterlockedPopEntryList(&pDevExt->NBCopiesCache, &pDevExt->NBCopiesCacheLock);
+		pCacheEntry = ExInterlockedPopEntryList(&pDevExt->NBCopiesCache, &pDevExt->NBCopiesCacheLock);
 	}
 
-	if (pCopiesEntry == NULL)
+	if (pCacheEntry == NULL)
 	{
 		pNBCopy = (PNPF_NB_COPIES) NPF_ObjectPoolGet(pDevExt->NBCopiesPool, bAtDispatchLevel);
 		if (pNBCopy == NULL)
@@ -607,7 +619,8 @@ PNPF_NB_COPIES NPF_GetNBCopy(
 	}
 	else
 	{
-		pNBCopy = CONTAINING_RECORD(pCopiesEntry, NPF_NB_COPIES, CopiesEntry);
+		pNBCopy = CONTAINING_RECORD(pCacheEntry, NPF_NB_COPIES, CacheEntry);
+		ASSERT(pNBCopy->pNetBuffer);
 	}
 
 	pNetBuffer = pNBCopy->pNetBuffer;
@@ -1103,6 +1116,7 @@ NPF_TapExForEachOpen(
 			}
 			// Increment refcounts on relevant structures
 			pCapData->pNBCopy = pNBCopy;
+			InterlockedIncrement(&pNBCopy->ulRefcount);
 			NPF_ReferenceObject(pNBCopy);
 			NPF_ReferenceObject(pNBLCopy);
 
