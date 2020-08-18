@@ -203,8 +203,6 @@ struct packet_file_header
 			+ 12 /* VHT */
 #endif
 
-#include "ObjPool.h"
-
 /*!
   \brief Header associated to a packet in the driver's buffer when the driver is in dump mode.
   Similar to the bpf_hdr structure, but simpler.
@@ -267,16 +265,20 @@ typedef struct _DEVICE_EXTENSION
 	NDIS_HANDLE FilterDriverHandle;
 	PDEVICE_OBJECT pDevObj; // pointer to the DEVICE_OBJECT for this device
 
-	PNPF_OBJ_POOL NBLCopyPool; // Pool of NPF_NBL_COPY objects
-	PNPF_OBJ_POOL NBCopiesPool; // Pool of NPF_NB_COPIES objects
-	SINGLE_LIST_ENTRY NBCopiesCache; // Cache of initialized NPF_NB_COPIES objects
-	KSPIN_LOCK NBCopiesCacheLock;
+	LOOKASIDE_LIST_EX BufferPool; // Pool of BUFCHAIN_ELEM to hold capture data temporarily.
+	LOOKASIDE_LIST_EX NBLCopyPool; // Pool of NPF_NBL_COPY objects
+	LOOKASIDE_LIST_EX NBCopiesPool; // Pool of NPF_NB_COPIES objects
+	LOOKASIDE_LIST_EX InternalRequestPool; // Pool of INTERNAL_REQUEST structures that wrap every single OID request.
+	LOOKASIDE_LIST_EX CapturePool; // Pool of NPF_CAP_DATA objects
 #ifdef HAVE_DOT11_SUPPORT
-	PNPF_OBJ_POOL Dot11HeaderPool; // Pool of Radiotap header buffers
+	LOOKASIDE_LIST_EX Dot11HeaderPool; // Pool of Radiotap header buffers
 #endif
-	KSEMAPHORE GCSemaphore; // Semaphore to signal garbage collection thread
-	BOOLEAN GCShouldStop; // Flag to kill garbage collection thread
-	PVOID GCThreadObj; // Pointer to the garbage collection thread itself.
+	UCHAR bBufferPoolInit:1;
+	UCHAR bNBLCopyPoolInit:1;
+	UCHAR bNBCopiesPoolInit:1;
+	UCHAR bInternalRequestPoolInit:1;
+	UCHAR bCapturePoolInit:1;
+	UCHAR bDot11HeaderPoolInit:1;
 } DEVICE_EXTENSION, *PDEVICE_EXTENSION;
 
 typedef enum _FILTER_STATE
@@ -346,8 +348,6 @@ typedef struct _NPCAP_FILTER_MODULE
 
 	NDIS_HANDLE				AdapterHandle;	///< NDIS idetifier of the adapter used by this instance.
 	NDIS_HANDLE				PacketPool;		///< Pool of NDIS_PACKET structures used to transfer the packets from and to the NIC driver.
-	NDIS_HANDLE TapNBPool; // Pool of NET_BUFFERs to hold capture data temporarily.
-	PNPF_OBJ_POOL InternalRequestPool; // Pool of INTERNAL_REQUEST structures that wrap every single OID request.
 	UINT					MaxFrameSize;	///< Maximum frame size that the underlying MAC acceptes. Used to perform a check on the
 											///< size of the frames sent with NPF_Write() or NPF_BufferedWrite().
 	ULONG					AdapterHandleUsageCounter;
@@ -413,7 +413,6 @@ typedef struct _OPEN_INSTANCE
 	PNDIS_RW_LOCK_EX MachineLock; ///< Lock that protects the BPF filter while in use.
 
 	/* Buffer */
-	PNPF_OBJ_POOL CapturePool; // Pool of NPF_CAP_DATA objects
 	PNDIS_RW_LOCK_EX BufferLock; // Lock for modifying the buffer size/configuration
 	LIST_ENTRY PacketQueue; // Head of packet buffer queue
 	KSPIN_LOCK PacketQueueLock; // Lock controlling buffer queue
@@ -443,12 +442,12 @@ typedef struct _OPEN_INSTANCE
 OPEN_INSTANCE, *POPEN_INSTANCE;
 
 /* This value should be sized to hold most packets processed by the driver. If
- * a packet (snaplen) exceeds this size, it will cost an additional buffer+MDL
+ * a packet (snaplen) exceeds this size, it will cost an additional BUFCHAIN_ELEM
  * allocation/free. On the other hand, every captured packet will use up at
  * least this much space in memory, so keep it small. Nmap uses 256 snaplen, so
  * we'll try that.
  */
-#define NPF_NBCOPY_INITIAL_DATA_SIZE 256
+#define NPF_BUFCHAIN_SIZE 256
 
 typedef struct _NPF_NBL_COPY
 {
@@ -458,22 +457,31 @@ typedef struct _NPF_NBL_COPY
 #ifdef HAVE_DOT11_SUPPORT
 	PUCHAR Dot11RadiotapHeader;
 #endif
+	ULONG refcount;
 } NPF_NBL_COPY, *PNPF_NBL_COPY;
 
-VOID NPF_FreeNBLCopy(_In_ PNPF_NBL_COPY pNBLCopy, _In_ BOOLEAN bAtDispatchLevel);
+/* Fixed-size buffers for holding packet data. Fixed size makes math easier and
+ * lets us use lookaside lists */
+typedef struct _BUFCHAIN_ELEM *PBUFCHAIN_ELEM;
+typedef struct _BUFCHAIN_ELEM
+{
+	PBUFCHAIN_ELEM Next;
+	UCHAR Buffer [NPF_BUFCHAIN_SIZE];
+} BUFCHAIN_ELEM;
 
+/* This is like a lower-overhead version of NET_BUFFER based on BUFCHAIN_ELEM instead of MDL */
 typedef struct _NPF_NB_COPIES
 {
 	SINGLE_LIST_ENTRY CopiesEntry;
-	SINGLE_LIST_ENTRY CacheEntry;
 	PNPF_NBL_COPY pNBLCopy;
-	PNET_BUFFER pNetBuffer; // May be NULL, hence why we can't just use NET_BUFFER.Next
-	ULONG ulSize; //Size of all allocated space in the netbuffer.
+	PBUFCHAIN_ELEM pFirstElem; // Bufchain of packet data
+	PBUFCHAIN_ELEM pLastElem; // Last elem in the chain
+	PMDL pSrcCurrMdl; // MDL where we left off copying from the source NET_BUFFER
+	ULONG ulCurrMdlOffset; // Position in that MDL.
+	ULONG ulSize; //Size of all used space in the bufchain.
 	ULONG ulPacketSize; // Size of the original packet
-	ULONG ulRefcount; // How many NPF_CAP_DATA are using this copy
+	ULONG refcount;
 } NPF_NB_COPIES, *PNPF_NB_COPIES;
-
-VOID NPF_FreeNBCopies(_In_ PNPF_NB_COPIES pNBCopy, _In_ BOOLEAN bAtDispatchLevel);
 
 /* Structure of a captured packet data description */
 typedef struct _NPF_CAP_DATA
@@ -484,22 +492,33 @@ typedef struct _NPF_CAP_DATA
 }
 NPF_CAP_DATA, *PNPF_CAP_DATA;
 
-VOID NPF_FreeCapData(_In_ PNPF_CAP_DATA pCapData, _In_ BOOLEAN bAtDispatchLevel);
+#define NPF_CAP_SIZE(_CapLen) (sizeof(struct bpf_hdr) + _CapLen)
 
 #ifdef HAVE_DOT11_SUPPORT
-#define NPF_CAP_SIZE(_P, _R) (sizeof(struct bpf_hdr) \
-		+ (_P)->ulCaplen \
+#define NPF_CAP_OBJ_SIZE(_P, _R) NPF_CAP_SIZE( \
+		(_P)->ulCaplen \
 		+ (_R != NULL ? _R->it_len : 0))
 #else
-#define NPF_CAP_SIZE(_P, _N) (sizeof(struct bpf_hdr) \
-		+ (_P)->ulCaplen)
+#define NPF_CAP_OBJ_SIZE(_P, _N) NPF_CAP_SIZE((_P)->ulCaplen)
 #endif
 
 VOID
 NPF_ResetBufferContents(
-	_In_ POPEN_INSTANCE Open,
+	_Inout_ POPEN_INSTANCE Open,
 	_In_ BOOLEAN AcquireLock
 );
+
+VOID NPF_ReturnNBCopies(
+	_In_ _Frees_ptr_ PNPF_NB_COPIES pNBCopy,
+	_In_ PDEVICE_EXTENSION pDevExt);
+
+VOID NPF_ReturnNBLCopy(
+	_In_ _Frees_ptr_ PNPF_NBL_COPY pNBLCopy,
+	_In_ PDEVICE_EXTENSION pDevExt);
+
+VOID NPF_ReturnCapData(
+	_In_ _Frees_ptr_ PNPF_CAP_DATA pCapData,
+	_In_ PDEVICE_EXTENSION pDevExt);
 
 /*!
 \brief Context information for originated sent packets
@@ -911,6 +930,7 @@ DRIVER_DISPATCH NPF_CloseAdapter;
   optimized.
 */
 VOID
+_When_(AtDispatchLevel != FALSE, _IRQL_requires_(DISPATCH_LEVEL))
 NPF_DoTap(
 	_In_ PNPCAP_FILTER_MODULE pFiltMod,
 	_In_ PNET_BUFFER_LIST NetBufferLists,
@@ -1064,9 +1084,9 @@ NPF_CreateFilterModule(
 	);
 
 VOID
-NPF_ReleaseOpenInstanceResources(_In_ POPEN_INSTANCE pOpen);
+NPF_ReleaseOpenInstanceResources(_Inout_ POPEN_INSTANCE pOpen);
 VOID
-NPF_ReleaseFilterModuleResources(_In_ PNPCAP_FILTER_MODULE pFiltMod);
+NPF_ReleaseFilterModuleResources(_Inout_ PNPCAP_FILTER_MODULE pFiltMod);
 
 
 #ifdef NPCAP_KDUMP
@@ -1135,15 +1155,19 @@ NTSTATUS NPF_CloseDumpFile(POPEN_INSTANCE Open);
 
 BOOLEAN NPF_IsOpenInstance(_In_ POPEN_INSTANCE pOpen);
 
-BOOLEAN NPF_StartUsingBinding(_In_ PNPCAP_FILTER_MODULE pFiltMod, _In_ BOOLEAN AtDispatchLevel);
+_When_(AtDispatchLevel != FALSE, _IRQL_requires_(DISPATCH_LEVEL))
+BOOLEAN NPF_StartUsingBinding(_Inout_ PNPCAP_FILTER_MODULE pFiltMod, _In_ BOOLEAN AtDispatchLevel);
 
-VOID NPF_StopUsingBinding(_In_ PNPCAP_FILTER_MODULE pFiltMod, _In_ BOOLEAN AtDispatchLevel);
+_When_(AtDispatchLevel != FALSE, _IRQL_requires_(DISPATCH_LEVEL))
+VOID NPF_StopUsingBinding(_Inout_ PNPCAP_FILTER_MODULE pFiltMod, _In_ BOOLEAN AtDispatchLevel);
 
-BOOLEAN NPF_StartUsingOpenInstance(_In_ POPEN_INSTANCE pOpen, _In_ OPEN_STATE MaxOpen, _In_ BOOLEAN AtDispatchLevel);
+_When_(AtDispatchLevel != FALSE, _IRQL_requires_(DISPATCH_LEVEL))
+BOOLEAN NPF_StartUsingOpenInstance(_Inout_ POPEN_INSTANCE pOpen, _In_ OPEN_STATE MaxOpen, _In_ BOOLEAN AtDispatchLevel);
 
-VOID NPF_StopUsingOpenInstance(_In_ POPEN_INSTANCE pOpen, _In_ OPEN_STATE MaxOpen, _In_ BOOLEAN AtDispatchLevel);
+_When_(AtDispatchLevel != FALSE, _IRQL_requires_(DISPATCH_LEVEL))
+VOID NPF_StopUsingOpenInstance(_Inout_ POPEN_INSTANCE pOpen, _In_ OPEN_STATE MaxOpen, _In_ BOOLEAN AtDispatchLevel);
 
-VOID NPF_CloseOpenInstance(_In_ POPEN_INSTANCE pOpen);
+VOID NPF_CloseOpenInstance(_Inout_ POPEN_INSTANCE pOpen);
 
 NTSTATUS NPF_GetDeviceMTU(_In_ PNPCAP_FILTER_MODULE pFiltMod, _Out_ PUINT  pMtu);
 

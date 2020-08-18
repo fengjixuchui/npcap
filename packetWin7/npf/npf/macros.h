@@ -49,12 +49,6 @@
 #ifndef __MACRO
 #define __MACRO
 
-#define NPF_CANCEL_ID_LOW_MASK	 (((ULONG_PTR)-1) >> 8)
-
-#define NPF_GET_NEXT_CANCEL_ID()  												 \
-	(PVOID)(Globals.PartialCancelId |   										\
-	((NdisInterlockedIncrement((PLONG)&Globals.LocalCancelId)) & NPROT_CANCEL_ID_LOW_MASK))
-
 #pragma pack(push)
 #pragma pack (1)
 
@@ -115,4 +109,35 @@ typedef struct _DLT_NULL_HEADER
 
 #pragma pack(pop)
 
+/* Interlocked API requires destination to be aligned to 32-bit boundaries.
+ * These functions just assert that to catch errors */
+#define INTERLOCKED_ALIGNMENT_BYTES 4
+#define ASSERT_INTERLOCKED_ALIGNED(_ptr) ASSERT(((ULONG_PTR)_ptr) % INTERLOCKED_ALIGNMENT_BYTES == 0)
+inline LONG
+NpfInterlockedIncrement (
+		_Inout_ _Interlocked_operand_ LONG volatile *Addend
+		)
+{
+	ASSERT_INTERLOCKED_ALIGNED(Addend);
+	return InterlockedIncrement(Addend);
+}
+
+inline LONG
+NpfInterlockedDecrement (
+		_Inout_ _Interlocked_operand_ LONG volatile *Addend
+		)
+{
+	ASSERT_INTERLOCKED_ALIGNED(Addend);
+	return InterlockedDecrement(Addend);
+}
+
+inline LONG
+NpfInterlockedExchangeAdd (
+		_Inout_ _Interlocked_operand_ LONG volatile *Addend,
+		_In_ LONG Value
+		)
+{
+	ASSERT_INTERLOCKED_ALIGNED(Addend);
+	return InterlockedExchangeAdd(Addend, Value);
+}
 #endif
