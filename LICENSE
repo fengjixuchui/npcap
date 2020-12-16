@@ -2,7 +2,7 @@
 NPCAP COPYRIGHT / END USER LICENSE AGREEMENT
 
 Npcap is a Windows packet sniffing driver and library and is copyright
-(c) 2013-2019 by Insecure.Com LLC ("The Nmap Project").  All rights
+(c) 2013-2020 by Insecure.Com LLC ("The Nmap Project").  All rights
 reserved.
 
 Even though Npcap source code is publicly available for review, it is
@@ -92,9 +92,8 @@ o The Nmap Security Scanner, as distributed from https://nmap.org
 o The Wireshark network protocol analyzer, as distributed from
   https://www.wireshark.org/
   
-o Microsoft's Azure Advanced Threat Protection (ATP) software,
-  as distributed from
-  https://azure.microsoft.com/en-us/features/azure-advanced-threat-protection/
+o Microsoft Defender for Identity, as distributed from
+  https://www.microsoft.com/en-us/microsoft-365/security/identity-defender
 
 Users wishing to redistribute Npcap or exceed the usage limits imposed
 by this free license or benefit from commercial support and features
@@ -200,16 +199,30 @@ are not permitted by applicable laws, these express or implied
 restrictions shall remain in force and effect to the maximum extent
 permitted by such applicable laws.
 
-WINPCAP & LIBPCAP ATTRIBUTION
+THIRD PARTY SOFTWARE ATTRIBUTION
 
-Some of the Npcap code is originally from WinPcap software
-(http://www.winpcap.org/). See
-https://github.com/nmap/npcap/blob/master/WinPcap-License-And-Acknowledgements.txt
-for further information and attribution related to that.
+Npcap uses several 3rd party open source software libraries:
 
-Npcap also includes and depends on the Libpcap packet capturing
-library, which is under a 3-clause BSD license allowing free
-redistribution and use in other software. The Libpcap license can be
-found at:
-https://github.com/nmap/npcap/blob/master/Libpcap-License.txt
+* The libpcap portable packet capturing library from https://tcpdump.org
+* The Winpcap packet capturing library. It has been abandoned, but is
+  currently still available from https://www.winpcap.org/.
+* The ieee80211_radiotap.h header file from David Young
 
+All of these are open source with BSD-style licenses that allow for
+unlimited use and royalty-free redistribution within other software
+(including commercial/proprietary software). Some include a warranty
+disclaimer (relating to the original authors) and require a small
+amount of acknowledgment text be added somewhere in the documentation
+of any software which includes them (including indirect inclusion
+through Npcap).
+
+The required acknowledgement text as well as full license text and
+source details for these libraries is available from:
+https://npcap.org/src/docs/Npcap-Third-Party-Open-Source.pdf .
+
+Since Insecure.Com LLC is not the author of this 3rd party code, we
+can not waive or modify it’s software copyright or license.  Npcap
+users and redistributors must comply with the relevant Npcap license
+(either the free/demo license or a commercial Npcap OEM license they
+may have purchased) as well as the minimal requirements of this 3rd
+party open source software.

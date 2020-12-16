@@ -266,8 +266,9 @@ typedef struct _DEVICE_EXTENSION
 	PDEVICE_OBJECT pDevObj; // pointer to the DEVICE_OBJECT for this device
 
 	LOOKASIDE_LIST_EX BufferPool; // Pool of BUFCHAIN_ELEM to hold capture data temporarily.
-	LOOKASIDE_LIST_EX NBLCopyPool; // Pool of NPF_NBL_COPY objects
+	LOOKASIDE_LIST_EX NBLCopyPool; // Pool of NPF_NBL_COPY, NPF_NB_COPIES, NPF_SRC_NB objects
 	LOOKASIDE_LIST_EX NBCopiesPool; // Pool of NPF_NB_COPIES objects
+	LOOKASIDE_LIST_EX SrcNBPool; // Pool of NPF_SRC_NB objects
 	LOOKASIDE_LIST_EX InternalRequestPool; // Pool of INTERNAL_REQUEST structures that wrap every single OID request.
 	LOOKASIDE_LIST_EX CapturePool; // Pool of NPF_CAP_DATA objects
 #ifdef HAVE_DOT11_SUPPORT
@@ -276,6 +277,7 @@ typedef struct _DEVICE_EXTENSION
 	UCHAR bBufferPoolInit:1;
 	UCHAR bNBLCopyPoolInit:1;
 	UCHAR bNBCopiesPoolInit:1;
+	UCHAR bSrcNBPoolInit:1;
 	UCHAR bInternalRequestPoolInit:1;
 	UCHAR bCapturePoolInit:1;
 	UCHAR bDot11HeaderPoolInit:1;
@@ -416,7 +418,8 @@ typedef struct _OPEN_INSTANCE
 	PNDIS_RW_LOCK_EX BufferLock; // Lock for modifying the buffer size/configuration
 	LIST_ENTRY PacketQueue; // Head of packet buffer queue
 	KSPIN_LOCK PacketQueueLock; // Lock controlling buffer queue
-	ULONG Free; // Bytes of buffer free for writing
+	LONG Free; // Bytes of buffer free for writing
+	LONG Size; ///< Size of the kernel buffer
 
 	/* Stats */
 	ULONG Accepted; /// A packet is accepted if it passes the filter and
@@ -425,10 +428,10 @@ typedef struct _OPEN_INSTANCE
 	ULONG Received; /// number of packet received by the network adapter
                         //  since the beginning of the capture session.
 	ULONG Dropped; /// A packet is dropped if there is no more space to
-		       //  store it in the circular buffer or if there is
+		       //  store it in the circular buffer.
+	ULONG ResourceDropped; /// A packet is resource-dropped if there is
 		       //  insufficient memory to allocate a copy.
 
-	ULONG Size; ///< Size of the kernel buffer
 	NDIS_EVENT				NdisWriteCompleteEvent;	///< Event that is signalled when all the packets have been successfully sent by NdisSend (and corresponfing sendComplete has been called)
 	ULONG					TransmitPendingPackets;	///< Specifies the number of packets that are pending to be transmitted, i.e. have been submitted to NdisSendXXX but the SendComplete has not been called yet.
 	ULONG PendingIrps[OpenClosed];
@@ -472,16 +475,29 @@ typedef struct _BUFCHAIN_ELEM
 /* This is like a lower-overhead version of NET_BUFFER based on BUFCHAIN_ELEM instead of MDL */
 typedef struct _NPF_NB_COPIES
 {
-	SINGLE_LIST_ENTRY CopiesEntry;
 	PNPF_NBL_COPY pNBLCopy;
-	PBUFCHAIN_ELEM pFirstElem; // Bufchain of packet data
-	PBUFCHAIN_ELEM pLastElem; // Last elem in the chain
-	PMDL pSrcCurrMdl; // MDL where we left off copying from the source NET_BUFFER
-	ULONG ulCurrMdlOffset; // Position in that MDL.
 	ULONG ulSize; //Size of all used space in the bufchain.
 	ULONG ulPacketSize; // Size of the original packet
 	ULONG refcount;
+	BUFCHAIN_ELEM FirstElem; // Bufchain of packet data
 } NPF_NB_COPIES, *PNPF_NB_COPIES;
+
+typedef struct _NPF_SRC_NB
+{
+	SINGLE_LIST_ENTRY CopiesEntry;
+	PNPF_NB_COPIES pNBCopy;
+	PBUFCHAIN_ELEM pLastElem; // Last elem in the chain
+	PMDL pSrcCurrMdl; // MDL where we left off copying from the source NET_BUFFER
+	ULONG ulCurrMdlOffset; // Position in that MDL.
+} NPF_SRC_NB, *PNPF_SRC_NB;
+
+// so we can use the same lookaside list for all these things
+typedef union _NPF_NB_STORAGE
+{
+	NPF_NBL_COPY NBLCopy;
+	NPF_SRC_NB SrcNB;
+	NPF_NB_COPIES NBCopy;
+} NPF_NB_STORAGE, *PNPF_NB_STORAGE;
 
 /* Structure of a captured packet data description */
 typedef struct _NPF_CAP_DATA
@@ -1083,8 +1099,11 @@ NPF_CreateFilterModule(
 	_In_ UINT SelectedIndex
 	);
 
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 NPF_ReleaseOpenInstanceResources(_Inout_ POPEN_INSTANCE pOpen);
+
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 NPF_ReleaseFilterModuleResources(_Inout_ PNPCAP_FILTER_MODULE pFiltMod);
 

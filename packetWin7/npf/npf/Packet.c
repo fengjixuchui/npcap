@@ -485,6 +485,14 @@ DriverEntry(
 		}
 		devExtP->bNBCopiesPoolInit = 1;
 
+		Status = ExInitializeLookasideListEx(&devExtP->SrcNBPool, NULL, NULL, NonPagedPool, 0, sizeof(NPF_SRC_NB), NPF_SRCNB_POOL_TAG, 0);
+		if (Status != STATUS_SUCCESS)
+		{
+			TRACE_MESSAGE(PACKET_DEBUG_LOUD, "Failed to allocate SrcNBPool");
+			break;
+		}
+		devExtP->bSrcNBPoolInit = 1;
+
 		Status = ExInitializeLookasideListEx(&devExtP->InternalRequestPool, NULL, NULL, NonPagedPool, 0, sizeof(INTERNAL_REQUEST), NPF_REQ_POOL_TAG, 0);
 		if (Status != STATUS_SUCCESS)
 		{
@@ -531,6 +539,8 @@ DriverEntry(
 			ExDeleteLookasideListEx(&devExtP->NBCopiesPool);
 		if (devExtP->bNBLCopyPoolInit)
 			ExDeleteLookasideListEx(&devExtP->NBLCopyPool);
+		if (devExtP->bSrcNBPoolInit)
+			ExDeleteLookasideListEx(&devExtP->SrcNBPool);
 		if (devExtP->bBufferPoolInit)
 			ExDeleteLookasideListEx(&devExtP->BufferPool);
 		if (devExtP->AllOpensLock)
@@ -640,9 +650,9 @@ NPF_registerLWF(
 
 	pFChars->MajorNdisVersion = NDIS_FILTER_MAJOR_VERSION;
 	pFChars->MinorNdisVersion = NDIS_FILTER_MINOR_VERSION;
+	// WINPCAP_MAJOR is 5 for Npcap
 	pFChars->MajorDriverVersion = WINPCAP_MINOR;
-	/* TODO: Stop using minor version numbers greater than 255 */
-	pFChars->MinorDriverVersion = WINPCAP_REV % MAXUCHAR;
+	pFChars->MinorDriverVersion = WINPCAP_REV;
 	pFChars->Flags = 0;
 
 	// Use different names for the WiFi driver.
@@ -991,6 +1001,7 @@ Return Value:
 		ExDeleteLookasideListEx(&DeviceExtension->BufferPool);
 		ExDeleteLookasideListEx(&DeviceExtension->NBLCopyPool);
 		ExDeleteLookasideListEx(&DeviceExtension->NBCopiesPool);
+		ExDeleteLookasideListEx(&DeviceExtension->SrcNBPool);
 		ExDeleteLookasideListEx(&DeviceExtension->InternalRequestPool);
 		ExDeleteLookasideListEx(&DeviceExtension->CapturePool);
 #ifdef HAVE_DOT11_SUPPORT
@@ -1027,12 +1038,15 @@ Return Value:
 	NdisAcquireSpinLock(&g_FilterArrayLock);
 	while (g_arrFiltMod.Next != NULL) {
 		PNPCAP_FILTER_MODULE pFiltMod = CONTAINING_RECORD(g_arrFiltMod.Next, NPCAP_FILTER_MODULE, FilterModulesEntry);
+#ifdef HAVE_WFP_LOOPBACK_SUPPORT
 		if (pFiltMod->Loopback) {
 			// NDIS doesn't manage this, so we "detach" it ourselves.
 			NdisReleaseSpinLock(&g_FilterArrayLock);
 			NPF_DetachAdapter(pFiltMod);
 		}
-		else {
+		else
+#endif
+		{
 			// Wait for NDIS to release it
 			NdisReleaseSpinLock(&g_FilterArrayLock);
 			NdisWaitEvent(&Event, 1);
@@ -1205,7 +1219,7 @@ NPF_IoControl(
 		
 		pStats[3] = Open->Accepted;
 		pStats[0] = Open->Received;
-		pStats[1] = Open->Dropped;
+		pStats[1] = Open->Dropped + Open->ResourceDropped;
 		pStats[2] = 0;		// Not yet supported
 
 		SET_RESULT_SUCCESS(StatsLength);
@@ -1852,7 +1866,7 @@ NPF_IoControl(
 
 			if (OidData->Oid == OID_GEN_CURRENT_PACKET_FILTER && FunctionCode == BIOCSETOID)
 			{
-				ASSERT(Open->pFiltMod != NULL);
+				NT_ASSERT(Open->pFiltMod != NULL);
 
 				// Disable setting Packet Filter for wireless adapters, because this will cause limited connectivity.
 				if (Open->pFiltMod->PhysicalMedium == NdisPhysicalMediumNative802_11)
@@ -2008,6 +2022,42 @@ OID_REQUEST_DONE:
 		SET_RESULT_SUCCESS(0);
 		break;
 
+	case BIOCGTIMESTAMPMODES:
+		// Need to at least deliver the number of modes
+		FAIL_IF_OUTPUT_SMALL(sizeof(ULONG));
+
+		dim = IrpSp->Parameters.DeviceIoControl.OutputBufferLength / sizeof(ULONG);
+		cnt = 0;
+		pUL = (PULONG)Irp->AssociatedIrp.SystemBuffer;
+		Status = STATUS_SUCCESS;
+
+		// Count each mode supported, and if they fit in the buffer, store them.
+#define NEXT_MODE(_M) if (dim > ++cnt) { \
+			pUL[cnt] = _M; \
+		} else { \
+			Status = STATUS_BUFFER_OVERFLOW; \
+		}
+		NEXT_MODE(TIMESTAMPMODE_SINGLE_SYNCHRONIZATION);
+		NEXT_MODE(TIMESTAMPMODE_QUERYSYSTEMTIME);
+		// Only report the _PRECISE version if it's different than QST
+		if (g_ptrQuerySystemTime !=
+#ifdef KeQuerySystemTime
+				&KeQuerySystemTimeWrapper
+#else
+				&KeQuerySystemTime
+#endif
+		   )
+		{
+			NEXT_MODE(TIMESTAMPMODE_QUERYSYSTEMTIME_PRECISE);
+		}
+		// First element is number of modes supported
+		*pUL = cnt;
+		// We didn't write more than dim ULONGs,
+		// nor more than the number of modes plus one to store the count
+		Information = sizeof(ULONG) * min(dim, cnt + 1);
+		// Status is set in NEXT_MODE()
+		break;
+
 	case BIOCGETPIDS:
 		// Need to at least deliver the number of PIDS
 		FAIL_IF_OUTPUT_SMALL(sizeof(ULONG));
@@ -2032,7 +2082,7 @@ OID_REQUEST_DONE:
 		NdisReleaseRWLock(Open->DeviceExtension->AllOpensLock, &lockState);
 
 		*pUL = cnt;
-		Information = sizeof(ULONG) * (cnt+1);
+		Information = sizeof(ULONG) * min(dim, cnt + 1);
 		Status = (cnt < dim) ? STATUS_SUCCESS : STATUS_BUFFER_OVERFLOW;
 		break;
 
